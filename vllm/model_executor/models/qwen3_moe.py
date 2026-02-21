@@ -78,6 +78,76 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+import torch
+from typing import Sequence, Optional
+
+def make_router_logits_round_robin(
+    T: int,
+    E: int,
+    top_k: int,
+    active_ids: Optional[Sequence[int]] = None,
+    *,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    off_value: float = -20.0,
+    on_base: float = 10.0,
+    on_step: float = 0.25,
+    seed: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Round-robin router logits.
+
+    If active_ids is None:
+        → all experts [0..E-1] are used
+    """
+
+    device = torch.device(device)
+
+    if active_ids is None:
+        active_ids = list(range(E))
+
+    active_ids_t = torch.tensor(active_ids, device=device, dtype=torch.long)
+    A = int(active_ids_t.numel())
+    
+    assert 1 <= top_k <= A <= E
+    assert int(active_ids_t.min()) >= 0 and int(active_ids_t.max()) < E
+
+    if seed is None:
+        start = (torch.arange(T, device=device) * top_k) % A
+    else:
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        start = torch.randint(0, A, (T,), generator=g, device=device)
+
+    slot = torch.arange(top_k, device=device).view(1, top_k)
+    idx_in_active = (start.view(T, 1) + slot) % A
+    topk_ids = active_ids_t[idx_in_active]
+
+    logits = torch.full((T, E), off_value, device=device, dtype=dtype)
+
+    slot_vals = (on_base - on_step * torch.arange(top_k, device=device, dtype=torch.float32)).to(dtype)
+    src = slot_vals.view(1, top_k).expand(T, top_k)
+
+    logits.scatter_(1, topk_ids, src)
+
+    return logits, topk_ids
+def count_activated_experts(router_logits: torch.Tensor, k: int) -> tuple[int, torch.Tensor]:
+    """
+    router_logits: (num_tokens, n_experts)
+    Returns:
+      - num_activated: number of experts that got >=1 routed token
+      - per_expert_counts: (n_experts,) token assignment counts (counts over top-k slots)
+    """
+    probs = torch.softmax(router_logits, dim=-1)          # (T, E)
+    topk_idx = probs.topk(k, dim=-1).indices              # (T, k)
+
+    n_experts = router_logits.size(-1)
+    per_expert_counts = torch.bincount(
+        topk_idx.reshape(-1),
+        minlength=n_experts
+    )
+    num_activated = (per_expert_counts > 0).sum().item()
+    return num_activated, per_expert_counts
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -196,9 +266,28 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        # print("input size: ", hidden_states.shape)
+        # print("top k: ", self.experts.top_k)
+        # print("num experts: ", self.n_routed_experts)
+        router_logits, _ = make_router_logits_round_robin(
+            T=hidden_states.shape[0], E=self.n_routed_experts, top_k=self.experts.top_k, #active_ids = list(range(50))+list(range(64, 114)),
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        num_activated, per_expert_counts = count_activated_experts(
+            router_logits, k=self.experts.top_k  # or whatever your config uses
+            )
+        # print("num exp activated: ", num_activated)
+        # # print(" per expert counts: ", per_expert_counts)
+        start_mlp = torch.cuda.Event(enable_timing=True)
+        end_mlp = torch.cuda.Event(enable_timing=True)
+        start_mlp.record()
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
+        end_mlp.record()
+        torch.cuda.synchronize()
+        print(" time taken by MLP: ", start_mlp.elapsed_time(end_mlp))
+        
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -384,14 +473,24 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        start_ = torch.cuda.Event(enable_timing=True)
+        end_ = torch.cuda.Event(enable_timing=True)
+        
+        start_.record()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        end_.record()
 
+        
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        # end_mlp.record()
+        torch.cuda.synchronize()
+        print("time attn: ", start_.elapsed_time(end_))
+        # print("time mlp: ", start_mlp.elapsed_time(end_mlp))
         return hidden_states, residual
 
 
@@ -724,9 +823,16 @@ class Qwen3MoeForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        print(input_ids.shape)
+        start.record()
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        end.record()
+        torch.cuda.synchronize()
+        print("time e2e: ", start.elapsed_time(end))
         return hidden_states
 
     def compute_logits(
