@@ -1,0 +1,190 @@
+Running benchmark with num_prompts=8
+INFO 02-22 11:06:23 [scheduler.py:216] Chunked prefill is enabled with max_num_batched_tokens=2048.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7711f28937e0>, seed=0, num_prompts=8, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, disable_shuffle=False, custom_output_len=256, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=None, model='Qwen/Qwen1.5-MoE-A2.7B', tokenizer=None, use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, trust_remote_code=False, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-1e45b1b5-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=600, extra_body=None)
+INFO 02-22 11:06:24 [datasets.py:613] Sampling input_len from [1024, 1024] and output_len from [128, 128]
+Starting initial single prompt test run...
+Waiting for endpoint to become up in 600 seconds
+Initial test run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: None
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     8         
+Failed requests:                         0         
+Benchmark duration (s):                  6.25      
+Total input tokens:                      8192      
+Total generated tokens:                  1024      
+Request throughput (req/s):              1.28      
+Output token throughput (tok/s):         163.87    
+Peak output token throughput (tok/s):    176.00    
+Peak concurrent requests:                8.00      
+Total Token throughput (tok/s):          1474.84   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          267.02    
+Median TTFT (ms):                        280.87    
+P99 TTFT (ms):                           369.08    
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          46.46     
+Median TPOT (ms):                        46.40     
+P99 TPOT (ms):                           46.90     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           46.46     
+Median ITL (ms):                         45.61     
+P99 ITL (ms):                            73.83     
+==================================================
+Completed run for num_prompts=8
+------------------------------------------
+Running benchmark with num_prompts=16
+INFO 02-22 11:06:45 [scheduler.py:216] Chunked prefill is enabled with max_num_batched_tokens=2048.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7e74c12c77e0>, seed=0, num_prompts=16, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, disable_shuffle=False, custom_output_len=256, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=None, model='Qwen/Qwen1.5-MoE-A2.7B', tokenizer=None, use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, trust_remote_code=False, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-d567dd2e-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=600, extra_body=None)
+INFO 02-22 11:06:46 [datasets.py:613] Sampling input_len from [1024, 1024] and output_len from [128, 128]
+Starting initial single prompt test run...
+Waiting for endpoint to become up in 600 seconds
+Initial test run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: None
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     16        
+Failed requests:                         0         
+Benchmark duration (s):                  6.42      
+Total input tokens:                      16384     
+Total generated tokens:                  2048      
+Request throughput (req/s):              2.49      
+Output token throughput (tok/s):         319.00    
+Peak output token throughput (tok/s):    368.00    
+Peak concurrent requests:                16.00     
+Total Token throughput (tok/s):          2871.01   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          235.53    
+Median TTFT (ms):                        202.28    
+P99 TTFT (ms):                           419.39    
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          47.56     
+Median TPOT (ms):                        47.66     
+P99 TPOT (ms):                           48.01     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           47.56     
+Median ITL (ms):                         45.49     
+P99 ITL (ms):                            75.08     
+==================================================
+Completed run for num_prompts=16
+------------------------------------------
+Running benchmark with num_prompts=32
+INFO 02-22 11:07:07 [scheduler.py:216] Chunked prefill is enabled with max_num_batched_tokens=2048.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7b152407b7e0>, seed=0, num_prompts=32, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, disable_shuffle=False, custom_output_len=256, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=None, model='Qwen/Qwen1.5-MoE-A2.7B', tokenizer=None, use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, trust_remote_code=False, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-1476227d-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=600, extra_body=None)
+INFO 02-22 11:07:08 [datasets.py:613] Sampling input_len from [1024, 1024] and output_len from [128, 128]
+Starting initial single prompt test run...
+Waiting for endpoint to become up in 600 seconds
+Initial test run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: None
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     32        
+Failed requests:                         0         
+Benchmark duration (s):                  6.68      
+Total input tokens:                      32768     
+Total generated tokens:                  4096      
+Request throughput (req/s):              4.79      
+Output token throughput (tok/s):         613.27    
+Peak output token throughput (tok/s):    704.00    
+Peak concurrent requests:                32.00     
+Total Token throughput (tok/s):          5519.45   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          337.20    
+Median TTFT (ms):                        230.52    
+P99 TTFT (ms):                           729.98    
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          47.64     
+Median TPOT (ms):                        47.95     
+P99 TPOT (ms):                           48.22     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           47.64     
+Median ITL (ms):                         46.01     
+P99 ITL (ms):                            76.41     
+==================================================
+Completed run for num_prompts=32
+------------------------------------------
+Running benchmark with num_prompts=64
+INFO 02-22 11:07:30 [scheduler.py:216] Chunked prefill is enabled with max_num_batched_tokens=2048.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x75dd6779f7e0>, seed=0, num_prompts=64, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, disable_shuffle=False, custom_output_len=256, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=None, model='Qwen/Qwen1.5-MoE-A2.7B', tokenizer=None, use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, trust_remote_code=False, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-aa3a40cb-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=600, extra_body=None)
+INFO 02-22 11:07:31 [datasets.py:613] Sampling input_len from [1024, 1024] and output_len from [128, 128]
+Starting initial single prompt test run...
+Waiting for endpoint to become up in 600 seconds
+Initial test run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: None
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     64        
+Failed requests:                         0         
+Benchmark duration (s):                  7.57      
+Total input tokens:                      65536     
+Total generated tokens:                  8192      
+Request throughput (req/s):              8.45      
+Output token throughput (tok/s):         1081.76   
+Peak output token throughput (tok/s):    1344.00   
+Peak concurrent requests:                64.00     
+Total Token throughput (tok/s):          9735.87   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          564.79    
+Median TTFT (ms):                        288.23    
+P99 TTFT (ms):                           1403.45   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          50.76     
+Median TPOT (ms):                        51.66     
+P99 TPOT (ms):                           52.02     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           50.76     
+Median ITL (ms):                         47.95     
+P99 ITL (ms):                            75.32     
+==================================================
+Completed run for num_prompts=64
+------------------------------------------
+Running benchmark with num_prompts=128
+INFO 02-22 11:07:54 [scheduler.py:216] Chunked prefill is enabled with max_num_batched_tokens=2048.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7e4c6dffb7e0>, seed=0, num_prompts=128, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, disable_shuffle=False, custom_output_len=256, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, random_input_len=1024, random_output_len=128, random_range_ratio=0.0, random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, label=None, backend='openai', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=None, model='Qwen/Qwen1.5-MoE-A2.7B', tokenizer=None, use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, trust_remote_code=False, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=True, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-1b215ef4-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, tokenizer_mode='auto', served_model_name=None, lora_modules=None, ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=600, extra_body=None)
+INFO 02-22 11:07:55 [datasets.py:613] Sampling input_len from [1024, 1024] and output_len from [128, 128]
+Starting initial single prompt test run...
+Waiting for endpoint to become up in 600 seconds
+Initial test run completed.
+Starting main benchmark run...
+Traffic request rate: inf
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: None
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     128       
+Failed requests:                         0         
+Benchmark duration (s):                  9.80      
+Total input tokens:                      131072    
+Total generated tokens:                  16384     
+Request throughput (req/s):              13.06     
+Output token throughput (tok/s):         1672.04   
+Peak output token throughput (tok/s):    2432.00   
+Peak concurrent requests:                128.00    
+Total Token throughput (tok/s):          15048.36  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1009.84   
+Median TTFT (ms):                        500.45    
+P99 TTFT (ms):                           2847.84   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          59.37     
+Median TPOT (ms):                        60.80     
+P99 TPOT (ms):                           61.54     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           59.37     
+Median ITL (ms):                         55.53     
+P99 ITL (ms):                            82.81     
+==================================================
+Completed run for num_prompts=128
+------------------------------------------

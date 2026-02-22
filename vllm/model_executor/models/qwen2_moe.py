@@ -27,7 +27,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -69,6 +69,74 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+def make_router_logits_round_robin(
+    T: int,
+    E: int,
+    top_k: int,
+    active_ids: Optional[Sequence[int]] = None,
+    *,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    off_value: float = -20.0,
+    on_base: float = 10.0,
+    on_step: float = 0.25,
+    seed: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Round-robin router logits.
+
+    If active_ids is None:
+        → all experts [0..E-1] are used
+    """
+
+    device = torch.device(device)
+
+    if active_ids is None:
+        active_ids = list(range(E))
+
+    active_ids_t = torch.tensor(active_ids, device=device, dtype=torch.long)
+    A = int(active_ids_t.numel())
+    
+    assert 1 <= top_k <= A <= E
+    assert int(active_ids_t.min()) >= 0 and int(active_ids_t.max()) < E
+
+    if seed is None:
+        start = (torch.arange(T, device=device) * top_k) % A
+    else:
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        start = torch.randint(0, A, (T,), generator=g, device=device)
+
+    slot = torch.arange(top_k, device=device).view(1, top_k)
+    idx_in_active = (start.view(T, 1) + slot) % A
+    topk_ids = active_ids_t[idx_in_active]
+
+    logits = torch.full((T, E), off_value, device=device, dtype=dtype)
+
+    slot_vals = (on_base - on_step * torch.arange(top_k, device=device, dtype=torch.float32)).to(dtype)
+    src = slot_vals.view(1, top_k).expand(T, top_k)
+
+    logits.scatter_(1, topk_ids, src)
+
+    return logits, topk_ids
+def count_activated_experts(router_logits: torch.Tensor, k: int) -> tuple[int, torch.Tensor]:
+    """
+    router_logits: (num_tokens, n_experts)
+    Returns:
+      - num_activated: number of experts that got >=1 routed token
+      - per_expert_counts: (n_experts,) token assignment counts (counts over top-k slots)
+    """
+    probs = torch.softmax(router_logits, dim=-1)          # (T, E)
+    topk_idx = probs.topk(k, dim=-1).indices              # (T, k)
+
+    n_experts = router_logits.size(-1)
+    per_expert_counts = torch.bincount(
+        topk_idx.reshape(-1),
+        minlength=n_experts
+    )
+    num_activated = (per_expert_counts > 0).sum().item()
+    return num_activated, per_expert_counts
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -139,7 +207,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-
+        self.num_experts = config.num_experts
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if config.shared_expert_intermediate_size > 0:
@@ -167,24 +235,88 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        # If set, we synthesize routing to activate this many experts (0..E)
+        num_active_experts: Optional[int] = None,
+        # If set, we synthesize routing to only use these experts (overrides num_active_experts)
+        active_ids: Optional[Sequence[int]] = None,
+        # Optional seed to randomize starting offsets (avoid structured patterns)
+        routing_seed: Optional[int] = None,
+        # If provided, bypass both gate + synthesis and use these logits directly
+        override_router_logits: Optional[torch.Tensor] = None,
+        # Values for logits construction (usually fine as defaults)
+        off_value: float = -20.0,
+        on_base: float = 10.0,
+        on_step: float = 0.25,
+    ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+        T = hidden_states.shape[0]
+
+        # Figure out E (num experts) and top_k from your modules
+        # Adjust these attribute names if your codebase differs.
+        # E = getattr(self.gate, "n_experts", None) or getattr(self.experts, "n_experts", None)
+        # if E is None:
+        #     # common alternative names
+        #     E = getattr(self.gate, "num_experts", None) or getattr(self.experts, "num_experts", None)
+        #     if E is None:
+        #         E = self.num
+        E = self.num_experts
+
+        assert E is not None, "Couldn't infer number of experts (E) from gate/experts."
+
+        top_k = getattr(self.experts, "top_k", None) or getattr(self.gate, "top_k", None)
+        assert top_k is not None, "Couldn't infer top_k from gate/experts."
+
+        # --- choose router_logits ---
+        # if override_router_logits is not None:
+        #     router_logits = override_router_logits
+        #     assert router_logits.shape == (T, E), f"override_router_logits must be {(T, E)}, got {router_logits.shape}"
+        #     router_logits = router_logits.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # elif active_ids is not None or num_active_experts is not None:
+            # if active_ids is None:
+            #     A = int(num_active_experts)
+            #     assert 1 <= A <= E, f"num_active_experts must be in [1, {E}], got {A}"
+            #     active_ids = list(range(A))
+        active_ids = list(range(60)), #+list(range(30,35)),
+        router_logits, _ = make_router_logits_round_robin(
+            T=T,
+            E=E,
+            top_k=top_k,
+            #active_ids=active_ids,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+            off_value=off_value,
+            on_base=on_base,
+            on_step=on_step,
+            seed=routing_seed,
         )
+        # router_logits, _ = self.gate(hidden_states)
+        num_activated, per_expert_counts = count_activated_experts(
+            router_logits, k=self.experts.top_k  # or whatever your config uses
+            )
+        # print("num exp activated: ", num_activated)
+        # else:
+        #     # Default: normal learned routing
+        #     router_logits, _ = self.gate(hidden_states)
+
+        # --- run experts ---
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+
+        # Shared experts path stays the same: all tokens go through shared expert(s)
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
-        if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
-                final_hidden_states
-            )
 
+        if self.tp_size > 1:
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+        # torch.cuda.synchronize()
         return final_hidden_states.view(orig_shape)
 
 
@@ -576,9 +708,16 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # start = torch.cuda.Event(enable_timing=True)
+        # end = torch.cuda.Event(enable_timing=True)
+        # start.record()
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+        # end.record()
+        # torch.cuda.synchronize()
+
+        # print("time: ", start.elapsed_time(end))
         return hidden_states
 
     def compute_logits(

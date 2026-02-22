@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-MODEL="Qwen/Qwen3-30B-A3B"
+MODEL="mistralai/Mixtral-8x7B-v0.1"
 DATASET="random"
 INPUT_LEN=1024
 OUTPUT_LEN=128
 
-for NUM_PROMPTS in 8 16 32 128
+for NUM_PROMPTS in 8 16 32 64 128
 do
   echo "Running benchmark with num_prompts=${NUM_PROMPTS}"
 
