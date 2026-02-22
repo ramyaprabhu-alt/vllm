@@ -46,6 +46,75 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+from typing import Sequence, Optional
+
+def make_router_logits_round_robin(
+    T: int,
+    E: int,
+    top_k: int,
+    active_ids: Optional[Sequence[int]] = None,
+    *,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.float16,
+    off_value: float = -20.0,
+    on_base: float = 10.0,
+    on_step: float = 0.25,
+    seed: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Round-robin router logits.
+
+    If active_ids is None:
+        → all experts [0..E-1] are used
+    """
+
+    device = torch.device(device)
+
+    if active_ids is None:
+        active_ids = list(range(E))
+
+    active_ids_t = torch.tensor(active_ids, device=device, dtype=torch.long)
+    A = int(active_ids_t.numel())
+    
+    assert 1 <= top_k <= A <= E
+    assert int(active_ids_t.min()) >= 0 and int(active_ids_t.max()) < E
+
+    if seed is None:
+        start = (torch.arange(T, device=device) * top_k) % A
+    else:
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        start = torch.randint(0, A, (T,), generator=g, device=device)
+
+    slot = torch.arange(top_k, device=device).view(1, top_k)
+    idx_in_active = (start.view(T, 1) + slot) % A
+    topk_ids = active_ids_t[idx_in_active]
+
+    logits = torch.full((T, E), off_value, device=device, dtype=dtype)
+
+    slot_vals = (on_base - on_step * torch.arange(top_k, device=device, dtype=torch.float32)).to(dtype)
+    src = slot_vals.view(1, top_k).expand(T, top_k)
+
+    logits.scatter_(1, topk_ids, src)
+
+    return logits, topk_ids
+def count_activated_experts(router_logits: torch.Tensor, k: int) -> tuple[int, torch.Tensor]:
+    """
+    router_logits: (num_tokens, n_experts)
+    Returns:
+      - num_activated: number of experts that got >=1 routed token
+      - per_expert_counts: (n_experts,) token assignment counts (counts over top-k slots)
+    """
+    probs = torch.softmax(router_logits, dim=-1)          # (T, E)
+    topk_idx = probs.topk(k, dim=-1).indices              # (T, k)
+
+    n_experts = router_logits.size(-1)
+    per_expert_counts = torch.bincount(
+        topk_idx.reshape(-1),
+        minlength=n_experts
+    )
+    num_activated = (per_expert_counts > 0).sum().item()
+    return num_activated, per_expert_counts
 
 
 class OAIAttention(nn.Module):
@@ -152,7 +221,7 @@ class MLPBlock(torch.nn.Module):
         parallel_config = vllm_config.parallel_config
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
-
+        self.num_expert_total = config.num_local_experts  
         self.layer_idx = layer_idx
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
@@ -174,24 +243,85 @@ class MLPBlock(torch.nn.Module):
             activation="swigluoai",
             is_sequence_parallel=self.is_sequence_parallel,
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        num_active_experts: Optional[int] = None,
+        active_ids: Optional[Sequence[int]] = None,
+        override_router_logits: Optional[torch.Tensor] = None,
+        routing_seed: Optional[int] = None,
+        off_value: float = -20.0,
+        on_base: float = 10.0,
+        on_step: float = 0.25,
+    ) -> torch.Tensor:
         num_tokens = x.shape[0]
+
         if self.is_sequence_parallel:
             x = sequence_parallel_chunk(x)
 
-        if current_platform.is_rocm():
-            g = rocm_unquantized_gemm(
-                self, x[:, : self.hidden_size], self.router.weight, self.router.bias
+        # Routing is computed on the (possibly chunked) x
+        T = x.shape[0]
+
+        # Infer expert count E and top_k
+        E = self.num_expert_total
+        # if E is None:
+        #     # very common: router weight is [E, H] or [E, ...]
+        #     E = self.router.weight.shape[0]
+        # assert E is not None, "Couldn't infer number of experts (E)."
+
+        top_k = getattr(self.experts, "top_k", None) or getattr(self, "top_k", None)
+        assert top_k is not None, "Couldn't infer top_k."
+
+        # --- choose router logits g ---
+        # if override_router_logits is not None:
+        #     g = override_router_logits
+        #     assert g.shape == (T, E), f"override_router_logits must be {(T, E)}, got {g.shape}"
+        #     g = g.to(device=x.device, dtype=x.dtype)
+
+        # elif active_ids is not None or num_active_experts is not None:
+        #     if active_ids is None:
+        #         A = int(num_active_experts)
+        #         assert 1 <= A <= E, f"num_active_experts must be in [1, {E}], got {A}"
+        #         active_ids = list(range(A))
+        active_ids = list(range(5))+list(range(64, 69))
+        g, _ = make_router_logits_round_robin(
+            T=T,
+            E=E,
+            top_k=top_k,
+            active_ids=active_ids,
+            device=x.device,
+            dtype=x.dtype,
+            off_value=off_value,
+            on_base=on_base,
+            on_step=on_step,
+            seed=routing_seed,
+        )
+        # else:
+        #     # Default: learned router
+        #     if current_platform.is_rocm():
+        #         g = rocm_unquantized_gemm(
+        #             self, x[:, : self.hidden_size], self.router.weight, self.router.bias
+        #         )
+        #     else:
+        #         g = self.router(x)
+
+        # Experts dispatch
+        num_activated, per_expert_counts = count_activated_experts(
+            g, k=self.experts.top_k  # or whatever your config uses
             )
-        else:
-            g = self.router(x)
+        # print("num exp activated: ", num_activated)
         x = self.experts(hidden_states=x, router_logits=g)
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
             x = x[:num_tokens]
+
         return x
+
 
 
 class TransformerBlock(torch.nn.Module):

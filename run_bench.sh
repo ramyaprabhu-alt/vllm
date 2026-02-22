@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-MODEL="mistralai/Mixtral-8x7B-v0.1"
+MODEL="openai/gpt-oss-120b"
 DATASET="random"
 INPUT_LEN=1024
 OUTPUT_LEN=128
