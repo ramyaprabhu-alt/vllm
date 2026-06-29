@@ -231,28 +231,60 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if self.is_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
+        # C+D_batch: inject FT tokens into this MoE call so expert weights are
+        # read once for both inference and FT tokens.  Skip when sequence
+        # parallelism is active (slicing semantics would need extra care).
+        ft_h: torch.Tensor | None = None
+        if not self.is_sequence_parallel:
+            try:
+                from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+                    ft_moe_get_hidden, ft_moe_advance, ft_moe_get_hidden_event,
+                )
+                ft_h = ft_moe_get_hidden()
+                if ft_h is not None:
+                    # In real-training C+D_batch mode the hidden state was written
+                    # on bwd_stream by the attention sub-op.  Wait for that event
+                    # before reading — expected wait ≈ 0ms since training attention
+                    # (128 tokens) completes within the inter-layer gap.
+                    ft_evt = ft_moe_get_hidden_event()
+                    if ft_evt is not None:
+                        torch.cuda.current_stream().wait_event(ft_evt)
+            except ImportError:
+                ft_h = None
 
-        if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
+        if ft_h is not None:
+            n_inf = hidden_states.shape[0]
+            combined = torch.cat([hidden_states, ft_h], dim=0)
+            if self.experts.is_internal_router:
+                combined_out = self.experts(
+                    hidden_states=combined, router_logits=combined
+                )
+            else:
+                router_logits, _ = self.gate(combined)
+                combined_out = self.experts(
+                    hidden_states=combined, router_logits=router_logits
+                )
+            final_hidden_states = combined_out[:n_inf]
+            ft_moe_advance(combined_out[n_inf:])
         else:
-            # Actually this will be dead code, since we always pass gate into
-            # FusedMoE in the current implementation. But we keep this code
-            # here for clarity and future flexibility.
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+            if self.is_sequence_parallel:
+                hidden_states = sequence_parallel_chunk(hidden_states)
 
-        if self.is_sequence_parallel:
-            final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, 0
-            )
-            final_hidden_states = final_hidden_states[:num_tokens]
+            if self.experts.is_internal_router:
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, router_logits=hidden_states
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
+
+            if self.is_sequence_parallel:
+                final_hidden_states = tensor_model_parallel_all_gather(
+                    final_hidden_states, 0
+                )
+                final_hidden_states = final_hidden_states[:num_tokens]
 
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
@@ -768,6 +800,29 @@ class Qwen3MoeForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # Trigger training Triton kernel warmup on the first forward call.
+        # The forward context is set here (during profiling), so layer.mlp()
+        # can be called without "Forward context is not set" errors.
+        # Warmup compiles fused_moe_kernel and FlashAttn backward for t_ft=128
+        # before any real inference request arrives.
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+            _bt_trainer,
+        )
+        if (getattr(self, '_bt_warmup_done', False) is False
+                and _bt_trainer is not None
+                and not getattr(_bt_trainer, '_warmup_done', False)):
+            _bt_trainer._warmup_done = True
+            _bt_trainer._warmup_training_kernels()
+            self._bt_warmup_done = True
+
+        # Sync replicated LoRA params (lora_A for Q/K/V, lora_B for O) from the
+        # rank that ran the optimizer to the other TP rank.  Both ranks are always
+        # in this forward() together so NCCL is safe here (no deadlock risk).
+        # Gated by VLLM_FT_SYNC_LORA_PARAMS=1; no-op when flag is off.
+        if _bt_trainer is not None:
+            _bt_trainer.sync_replicated_params()
+
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -782,7 +837,79 @@ class Qwen3MoeForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        self._maybe_init_bt_trainer()
+        return loaded
+
+    def _maybe_init_bt_trainer(self) -> None:
+        """Initialise real LoRA trainer if VLLM_FT_LORA_PATH is set."""
+        import os
+        lora_path_dir = os.environ.get("VLLM_FT_LORA_PATH", "")
+        if not lora_path_dir:
+            return
+        adapter_file = os.path.join(lora_path_dir, "adapter_model.safetensors")
+        if not os.path.exists(adapter_file):
+            import warnings
+            warnings.warn(
+                f"[BubbleTea] VLLM_FT_LORA_PATH={lora_path_dir} but "
+                f"adapter_model.safetensors not found — real training disabled."
+            )
+            return
+        try:
+            import torch
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+                register_bt_trainer,
+            )
+            import sys, pathlib
+            _root = str(pathlib.Path(__file__).parents[3])  # → /mnt/nfs/home/ramya/vllm
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+            from bt_lora_trainer import BubbleTeaLoRATrainer
+
+            tokenizer_path = os.environ.get(
+                "VLLM_FT_TOKENIZER_PATH",
+                "/mnt/nfs/home/ramya/models/Qwen/Qwen3-30B-A3B",
+            )
+            cache_dir = os.environ.get(
+                "VLLM_FT_CACHE_DIR", "/mnt/nfs/home/ramya/scratch"
+            )
+            t_ft        = int(os.environ.get("VLLM_FT_COMBINED_T_FT",    "128"))
+            accum_steps = int(os.environ.get("VLLM_FT_ACCUM_STEPS",     "4"))
+            device = torch.cuda.current_device()
+
+            from vllm.distributed.parallel_state import get_ep_group as _get_ep_group
+            _ep_grp = _get_ep_group()
+            _ep_rank = _ep_grp.rank_in_group
+            _ep_size = _ep_grp.world_size
+            _first_moe = next(
+                (l.mlp for l in self.model.layers
+                 if hasattr(l, 'mlp') and hasattr(l.mlp, 'experts')
+                 and hasattr(l.mlp.experts, 'ep_rank')),
+                None,
+            )
+            _ep_expert_start      = (_first_moe.experts.ep_rank * _first_moe.experts.local_num_experts
+                                      if _first_moe else 0)
+            _ep_num_local_experts = _first_moe.experts.local_num_experts if _first_moe else 64
+
+            trainer = BubbleTeaLoRATrainer(
+                model=self,
+                adapter_path=adapter_file,
+                tokenizer_path=tokenizer_path,
+                device=device,
+                cache_dir=cache_dir,
+                accum_steps=accum_steps,
+                t_ft=t_ft,
+                ep_rank=_ep_rank,
+                ep_size=_ep_size,
+                ep_expert_start=_ep_expert_start,
+                ep_num_local_experts=_ep_num_local_experts,
+            )
+            register_bt_trainer(trainer)
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"[BubbleTea] Failed to initialise real LoRA trainer: {exc}"
+            )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
