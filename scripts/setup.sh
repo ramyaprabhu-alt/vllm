@@ -5,8 +5,9 @@
 #   bash scripts/setup.sh
 #
 # Optional environment variables (set before running, or export them):
-#   MODEL_DIR   — path to Qwen3-30B-A3B weights  (default: ~/models/Qwen/Qwen3-30B-A3B)
-#   CACHE_DIR   — HuggingFace datasets cache      (default: ~/scratch)
+#   VENV_DIR    — venv directory name              (default: .venv)
+#   MODEL_DIR   — path to Qwen3-30B-A3B weights   (default: ~/models/Qwen/Qwen3-30B-A3B)
+#   CACHE_DIR   — HuggingFace datasets cache       (default: ~/scratch)
 #   HF_TOKEN    — HuggingFace token (required for model download if not cached)
 
 set -euo pipefail
@@ -57,12 +58,14 @@ ok "uv: $(uv --version)"
 echo
 echo "--- Setting up Python environment ---"
 
-if [ ! -d ".venv" ]; then
-    echo "Creating .venv (Python 3.12) ..."
-    uv venv --python 3.12
-    ok "Created .venv"
+VENV_DIR="${VENV_DIR:-.venv}"
+
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating $VENV_DIR (Python 3.12) ..."
+    uv venv "$VENV_DIR" --python 3.12
+    ok "Created $VENV_DIR"
 else
-    ok ".venv already exists — skipping creation"
+    ok "$VENV_DIR already exists — skipping creation"
 fi
 
 # ── 3. Install vLLM + dependencies ───────────────────────────────────────────
@@ -70,20 +73,20 @@ echo
 echo "--- Installing vLLM (Python-only, precompiled CUDA kernels) ---"
 echo "This may take a few minutes on first run ..."
 
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+VLLM_USE_PRECOMPILED=1 uv pip install --python "$VENV_DIR/bin/python" -e . --torch-backend=auto
 ok "vLLM installed"
 
 # BubbleTea extra deps (safetensors is pulled by vLLM; datasets/transformers/requests listed explicitly)
 echo "Installing BubbleTea dependencies ..."
-uv pip install "safetensors>=0.4" "datasets>=2.18" "transformers>=4.40" "requests>=2.31"
+uv pip install --python "$VENV_DIR/bin/python" "safetensors>=0.4" "datasets>=2.18" "transformers>=4.40" "requests>=2.31"
 ok "BubbleTea dependencies installed"
 
 # ── 4. Pre-commit hooks (optional but recommended) ───────────────────────────
 echo
 echo "--- Pre-commit hooks ---"
 if [ -f "requirements/lint.txt" ]; then
-    uv pip install -r requirements/lint.txt
-    .venv/bin/pre-commit install
+    uv pip install --python "$VENV_DIR/bin/python" -r requirements/lint.txt
+    "$VENV_DIR/bin/pre-commit" install
     ok "pre-commit hooks installed"
 else
     warn "requirements/lint.txt not found — skipping pre-commit"
@@ -101,7 +104,7 @@ else
     warn "Model not found at $MODEL_DIR"
     echo "  Download with:"
     echo "    export HF_TOKEN=<your_token>"
-    echo "    .venv/bin/python -c \\"
+    echo "    $VENV_DIR/bin/python -c \\"
     echo "      \"from huggingface_hub import snapshot_download; \\"
     echo "       snapshot_download('Qwen/Qwen3-30B-A3B', local_dir='$MODEL_DIR')\""
 fi
@@ -119,10 +122,10 @@ echo "  export HF_DATASETS_OFFLINE=1   # use local cache, avoid hub checks"
 echo "  export TRANSFORMERS_OFFLINE=1"
 echo
 echo "Activate the venv:"
-echo "  source .venv/bin/activate"
+echo "  source $VENV_DIR/bin/activate"
 echo
 echo "Quick-start — serve Qwen3-30B-A3B with BubbleTea:"
-echo "  MODEL_DIR=\$MODEL_DIR bash scripts/run_qwen3_30b_a3b.sh"
+echo "  VENV=\"\$PWD/$VENV_DIR\" MODEL_DIR=\$MODEL_DIR bash scripts/run_qwen3_30b_a3b.sh"
 echo
 echo "Run tests:"
-echo "  .venv/bin/python -m pytest tests/bubbletea/ -v"
+echo "  $VENV_DIR/bin/python -m pytest tests/bubbletea/ -v"
