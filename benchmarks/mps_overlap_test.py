@@ -52,7 +52,7 @@ def _backward_worker(gpu_id: int, stop_event: mp.Event, mps_pct: int | None):
 
     import sys, pathlib
     sys.path.insert(0, str(pathlib.Path(__file__).parent))
-    from backward_subops import (
+    from bubbletea.backward_subops import (
         _attn_bwd_op, _moe_chunk_bwd_op,
         H, Q_DIM, KV_DIM, Q_HEADS, KV_HEADS, HEAD_DIM, N_EXPERTS, MOE_INT, DTYPE
     )

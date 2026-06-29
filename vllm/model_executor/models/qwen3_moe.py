@@ -864,7 +864,7 @@ class Qwen3MoeForCausalLM(
             _root = str(pathlib.Path(__file__).parents[3])  # → /mnt/nfs/home/ramya/vllm
             if _root not in sys.path:
                 sys.path.insert(0, _root)
-            from bt_lora_trainer import BubbleTeaLoRATrainer
+            from bubbletea.trainer import BubbleTeaLoRATrainer
 
             tokenizer_path = os.environ.get(
                 "VLLM_FT_TOKENIZER_PATH",

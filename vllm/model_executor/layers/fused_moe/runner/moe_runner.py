@@ -525,7 +525,7 @@ def _submit_demo_job() -> None:
         _root = str(pathlib.Path(__file__).parents[5])
         if _root not in sys.path:
             sys.path.insert(0, _root)
-        from backward_subops import build_qwen3_subops
+        from bubbletea.backward_subops import build_qwen3_subops
         dev = torch.cuda.current_device()
         # Build outside inference_mode: backward sub-ops call
         # q.detach().requires_grad_(True) at execution time; that fails on
@@ -576,7 +576,7 @@ def _submit_fwd_demo_job() -> None:
         _root = str(pathlib.Path(__file__).parents[5])
         if _root not in sys.path:
             sys.path.insert(0, _root)
-        from forward_subops import build_qwen3_fwd_subops
+        from bubbletea.forward_subops import build_qwen3_fwd_subops
         dev = torch.cuda.current_device()
         sub_ops = build_qwen3_fwd_subops(t_ft=128, n_layers=48, moe_chunk_size=8, device=dev)
         _tr_str = os.environ.get("VLLM_FT_FWD_RANK", "")
@@ -683,7 +683,7 @@ def _submit_combined_fwd_job() -> None:
             _root = str(pathlib.Path(__file__).parents[5])
             if _root not in sys.path:
                 sys.path.insert(0, _root)
-            from forward_subops import build_qwen3_fwd_subops
+            from bubbletea.forward_subops import build_qwen3_fwd_subops
             fwd_ops = build_qwen3_fwd_subops(
                 t_ft=_COMBINED_T_FT, n_layers=48, moe_chunk_size=8, device=dev
             )
@@ -724,7 +724,7 @@ def _submit_combined_bwd_job() -> None:
             _root = str(pathlib.Path(__file__).parents[5])
             if _root not in sys.path:
                 sys.path.insert(0, _root)
-            from backward_subops import build_qwen3_subops
+            from bubbletea.backward_subops import build_qwen3_subops
             with torch.inference_mode(False):
                 bwd_ops = build_qwen3_subops(
                     t_ft=128, n_layers=48, moe_chunk_size=8, device=dev
@@ -767,8 +767,8 @@ def _submit_combined_dd_job() -> None:
             _root = str(pathlib.Path(__file__).parents[5])
             if _root not in sys.path:
                 sys.path.insert(0, _root)
-            from forward_subops import build_qwen3_fwd_subops
-            from backward_subops import build_qwen3_subops
+            from bubbletea.forward_subops import build_qwen3_fwd_subops
+            from bubbletea.backward_subops import build_qwen3_subops
             fwd_ops = build_qwen3_fwd_subops(
                 t_ft=_COMBINED_T_FT, n_layers=48, moe_chunk_size=8, device=dev
             )

@@ -18,7 +18,7 @@ work finishes.  Pass a post_complete_fn to VllmBubbleScheduler to trigger
 the allreduce once this rank's backward stream has synchronised.
 
 Usage:
-    from backward_subops import build_qwen3_subops
+    from bubbletea.backward_subops import build_qwen3_subops
     sub_ops = build_qwen3_subops(
         t_ft=128, n_layers=48, moe_chunk_size=8, device=0)
     sched = VllmBubbleScheduler(sub_ops, device=0,

@@ -35,7 +35,7 @@ sys.path.insert(0, '/mnt/nfs/home/ramya/vllm')
 import torch
 import torch.distributed as dist
 
-import bt_lora_trainer as blt
+import bubbletea.trainer as blt
 
 H       = 2048    # Qwen3-30B-A3B hidden size
 LAYERS  = 48

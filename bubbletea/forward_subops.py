@@ -17,7 +17,7 @@ the activations a real FT forward would produce, with matching FLOP count,
 but discard outputs immediately.
 
 Usage:
-    from forward_subops import build_qwen3_fwd_subops
+    from bubbletea.forward_subops import build_qwen3_fwd_subops
     sub_ops = build_qwen3_fwd_subops(t_ft=128, device=0)
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
         submit_forward_job)
