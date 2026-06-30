@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Safety test for VLLM_FT_TP_CORRECT's TCPStore-based exchange
 (_tp_correct_exchange_sum, see bt_lora_trainer.py).
@@ -25,6 +27,7 @@ permanently desync):
 Run (CPU, no GPU needed):
     torchrun --nproc_per_node=2 test_bt_lora_tp_correct_safety.py
 """
+
 import os
 
 # Short timeout so the timeout-path check (step 2) doesn't take long. Must be
@@ -34,12 +37,12 @@ os.environ.setdefault("VLLM_FT_TP_CORRECT_TIMEOUT_MS", "200")
 import sys
 import time
 
-sys.path.insert(0, '/mnt/nfs/home/ramya/vllm')
+sys.path.insert(0, "/mnt/nfs/home/ramya/vllm")
 
 import torch
 import torch.distributed as dist
 
-import bt_lora_trainer as blt
+import bubbletea.trainer as blt
 
 TIMEOUT_S = blt._TP_CORRECT_TIMEOUT_MS / 1000.0
 
@@ -107,12 +110,15 @@ def main() -> None:
         print(f"[rank {rank}] FAIL step3: expected local fallback {t3}, got {out3}")
         ok = False
     elif elapsed > TIMEOUT_S * 5:
-        print(f"[rank {rank}] FAIL step3: took {elapsed:.3f}s "
-              f"(round-id mismatch should be detected without waiting)")
+        print(
+            f"[rank {rank}] FAIL step3: took {elapsed:.3f}s "
+            f"(round-id mismatch should be detected without waiting)"
+        )
         ok = False
     else:
-        print(f"[rank {rank}] step3 OK: fell back on round_id mismatch "
-              f"in {elapsed:.3f}s")
+        print(
+            f"[rank {rank}] step3 OK: fell back on round_id mismatch in {elapsed:.3f}s"
+        )
 
     dist.barrier()
 
@@ -137,8 +143,10 @@ def main() -> None:
         print(f"[rank {rank}] FAIL step5: x={x}, elapsed={elapsed:.3f}s")
         ok = False
     else:
-        print(f"[rank {rank}] step5 OK: default PG all-reduce succeeded "
-              f"({x}, {elapsed:.3f}s)")
+        print(
+            f"[rank {rank}] step5 OK: default PG all-reduce succeeded "
+            f"({x}, {elapsed:.3f}s)"
+        )
 
     dist.barrier()
     dist.destroy_process_group()

@@ -583,6 +583,26 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # Trigger BubbleTea training kernel warmup on the first forward call
+        # (same pattern as qwen3_moe.py — forward context is set here so the
+        # fused_moe_kernel and FlashAttn backward can be compiled safely).
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+            _bt_trainer,
+        )
+
+        if (
+            getattr(self, "_bt_warmup_done", False) is False
+            and _bt_trainer is not None
+            and not getattr(_bt_trainer, "_warmup_done", False)
+        ):
+            _bt_trainer._warmup_done = True
+            _bt_trainer._warmup_training_kernels()
+            self._bt_warmup_done = True
+
+        # Sync replicated LoRA params across TP ranks after each optimizer step.
+        if _bt_trainer is not None:
+            _bt_trainer.sync_replicated_params()
+
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -597,7 +617,98 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        self._maybe_init_bt_trainer()
+        return loaded
+
+    def _maybe_init_bt_trainer(self) -> None:
+        """Initialise real LoRA trainer if VLLM_FT_LORA_PATH is set."""
+        import os
+
+        lora_path_dir = os.environ.get("VLLM_FT_LORA_PATH", "")
+        if not lora_path_dir:
+            return
+        adapter_file = os.path.join(lora_path_dir, "adapter_model.safetensors")
+        if not os.path.exists(adapter_file):
+            import warnings
+
+            warnings.warn(
+                f"[BubbleTea] VLLM_FT_LORA_PATH={lora_path_dir} but "
+                "adapter_model.safetensors not found — real training disabled.",
+                stacklevel=2,
+            )
+            return
+        try:
+            import pathlib
+            import sys
+
+            import torch as _torch
+
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+                register_bt_trainer,
+            )
+
+            _root = str(pathlib.Path(__file__).parents[3])  # → /mnt/nfs/home/ramya/vllm
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+            from bubbletea.trainer import BubbleTeaLoRATrainer
+
+            tokenizer_path = os.environ.get(
+                "VLLM_FT_TOKENIZER_PATH",
+                "/mnt/nfs/home/ramya/models/Qwen/Qwen1.5-MoE-A2.7B",
+            )
+            cache_dir = os.environ.get(
+                "VLLM_FT_CACHE_DIR", "/mnt/nfs/home/ramya/scratch"
+            )
+            t_ft = int(os.environ.get("VLLM_FT_COMBINED_T_FT", "128"))
+            accum_steps = int(os.environ.get("VLLM_FT_ACCUM_STEPS", "4"))
+            device = _torch.cuda.current_device()
+
+            from vllm.distributed.parallel_state import get_ep_group as _get_ep_group
+
+            _ep_grp = _get_ep_group()
+            _ep_rank = _ep_grp.rank_in_group
+            _ep_size = _ep_grp.world_size
+            _first_moe = next(
+                (
+                    layer.mlp
+                    for layer in self.model.layers
+                    if hasattr(layer, "mlp")
+                    and hasattr(layer.mlp, "experts")
+                    and hasattr(layer.mlp.experts, "ep_rank")
+                ),
+                None,
+            )
+            _ep_expert_start = (
+                _first_moe.experts.ep_rank * _first_moe.experts.local_num_experts
+                if _first_moe
+                else 0
+            )
+            _ep_num_local_experts = (
+                _first_moe.experts.local_num_experts if _first_moe else 60
+            )
+
+            trainer = BubbleTeaLoRATrainer(
+                model=self,
+                adapter_path=adapter_file,
+                tokenizer_path=tokenizer_path,
+                device=device,
+                cache_dir=cache_dir,
+                accum_steps=accum_steps,
+                t_ft=t_ft,
+                ep_rank=_ep_rank,
+                ep_size=_ep_size,
+                ep_expert_start=_ep_expert_start,
+                ep_num_local_experts=_ep_num_local_experts,
+            )
+            register_bt_trainer(trainer)
+        except Exception as exc:
+            import warnings
+
+            warnings.warn(
+                f"[BubbleTea] Failed to initialise real LoRA trainer: {exc}",
+                stacklevel=2,
+            )
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

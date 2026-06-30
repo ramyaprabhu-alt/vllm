@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Standalone test for item 8 (EP-correct MoE forward delta wiring) in
 build_fwd_subops_cdbatch (see /mnt/nfs/home/ramya/slora-plus/Sessions_10_6_2026.md).
@@ -27,20 +29,24 @@ checks that:
 Run (single GPU):
     .venv/bin/python test_bt_lora_cdbatch_moe_delta.py
 """
+
 import os
 import sys
 import tempfile
 
-sys.path.insert(0, '/mnt/nfs/home/ramya/vllm')
+sys.path.insert(0, "/mnt/nfs/home/ramya/vllm")
 
 import torch
-
-import bt_lora_trainer as blt
-from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
 from test_bt_lora_unit import (
-    _make_bare_trainer, _make_mock_model, _make_toy_safetensors,
-    _PatchToyDims, TOY_LAYERS, DEVICE,
+    DEVICE,
+    TOY_LAYERS,
+    _make_bare_trainer,
+    _make_mock_model,
+    _make_toy_safetensors,
+    _PatchToyDims,
 )
+
+from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
 
 
 def _reset_ft_moe_state():
@@ -54,8 +60,9 @@ def _reset_ft_moe_state():
 def main() -> None:
     assert torch.cuda.is_available(), "this test requires a CUDA device"
 
-    adapter_path = os.path.join(tempfile.gettempdir(),
-                                 "bt_lora_cdbatch_moe_delta_adapter.safetensors")
+    adapter_path = os.path.join(
+        tempfile.gettempdir(), "bt_lora_cdbatch_moe_delta_adapter.safetensors"
+    )
     _make_toy_safetensors(adapter_path, nonzero_b=True)
 
     ctx = _PatchToyDims()
@@ -89,8 +96,11 @@ def main() -> None:
         fwd_ops[i + 1]()  # _fwd_attn_only(i)
 
         expected_hidden = hidden_in + fake_delta if i > 0 else hidden_in
-        expected_res_a = (expected_hidden + residual_in
-                           if residual_in is not None else expected_hidden)
+        expected_res_a = (
+            expected_hidden + residual_in
+            if residual_in is not None
+            else expected_hidden
+        )
         actual_res_a = trainer._fwd["layers"][i]["res_a"]
         match = torch.allclose(actual_res_a, expected_res_a)
         ok &= match
@@ -124,8 +134,9 @@ def main() -> None:
     fwd_ops[0]()  # _fwd_init_cdbatch (resets moe_delta via ft_moe_reset_moe_delta)
     state = trainer._fwd_layer_state
     assert state is not None and state["ok"], "round 2 init failed"
-    assert mr.ft_moe_get_moe_delta_layer() == -1, \
+    assert mr.ft_moe_get_moe_delta_layer() == -1, (
         "ft_moe_reset_moe_delta should clear moe_delta_layer at round start"
+    )
 
     for i in range(N):
         hidden_in = trainer._fwd_layer_state["hidden"].clone()
@@ -134,8 +145,9 @@ def main() -> None:
 
         fwd_ops[i + 1]()  # _fwd_attn_only(i), no ft_moe_advance called
 
-        expected_res_a = (hidden_in + residual_in
-                           if residual_in is not None else hidden_in)
+        expected_res_a = (
+            hidden_in + residual_in if residual_in is not None else hidden_in
+        )
         actual_res_a = trainer._fwd["layers"][i]["res_a"]
         match = torch.allclose(actual_res_a, expected_res_a)
         ok &= match

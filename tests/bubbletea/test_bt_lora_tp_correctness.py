@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Standalone TP=2 correctness test for bt_lora_trainer.py items 1, 3-6 and 7
 (see /mnt/nfs/home/ramya/slora-plus/Sessions_10_6_2026.md):
@@ -24,30 +26,39 @@ batch:
 Run (2 GPUs, or CPU via gloo if no GPU):
     torchrun --nproc_per_node=2 test_bt_lora_tp_correctness.py
 """
+
 import os
 import sys
 import tempfile
 import threading
 import types
 
-sys.path.insert(0, '/mnt/nfs/home/ramya/vllm')
+sys.path.insert(0, "/mnt/nfs/home/ramya/vllm")
 
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
-
-import bt_lora_trainer as blt
 from test_bt_lora_unit import (
-    _make_toy_safetensors, _MockFusedNorm, _PatchToyDims,
-    TOY_H, TOY_HEADS, TOY_KV, TOY_HD, TOY_LAYERS, TOY_VOCAB, TOY_RANK, TOY_T,
+    TOY_H,
+    TOY_HD,
+    TOY_HEADS,
+    TOY_KV,
+    TOY_LAYERS,
+    TOY_T,
+    TOY_VOCAB,
+    _make_toy_safetensors,
+    _MockFusedNorm,
+    _PatchToyDims,
 )
 
-Q_SZ  = TOY_HEADS * TOY_HD   # 64
-KV_SZ = TOY_KV * TOY_HD      # 32
-SEED  = 1234
+import bubbletea.trainer as blt
+
+Q_SZ = TOY_HEADS * TOY_HD  # 64
+KV_SZ = TOY_KV * TOY_HD  # 32
+SEED = 1234
 LAST_LAYER = TOY_LAYERS - 1  # only this layer's LoRA params get gradient
-                             # (see _forward_loss: loss depends only on the
-                             # last layer's attn_out)
+# (see _forward_loss: loss depends only on the
+# last layer's attn_out)
 
 
 def _make_layer(qkv_w, o_w, device):
@@ -73,15 +84,27 @@ class _Embed:
         return self.weight[ids]
 
 
-def _build_trainer(tp_size, tp_rank, qkv_layers, o_layers, embed_w, lm_w,
-                    adapter_path, device, input_ids, labels,
-                    train_tp_pg=None, tp_correct_store=None, tp_correct=False):
+def _build_trainer(
+    tp_size,
+    tp_rank,
+    qkv_layers,
+    o_layers,
+    embed_w,
+    lm_w,
+    adapter_path,
+    device,
+    input_ids,
+    labels,
+    train_tp_pg=None,
+    tp_correct_store=None,
+    tp_correct=False,
+):
     """Construct a BubbleTeaLoRATrainer via object.__new__ (bypassing
     __init__'s vLLM-distributed dependencies), mirroring
     test_bt_lora_unit.py's _make_bare_trainer but parameterised for TP."""
     trainer = object.__new__(blt.BubbleTeaLoRATrainer)
 
-    trainer.device = device.index if device.type == 'cuda' else 0
+    trainer.device = device.index if device.type == "cuda" else 0
     trainer._tp_size = tp_size
     trainer._tp_rank = tp_rank
     trainer._tp_group = None
@@ -94,7 +117,7 @@ def _build_trainer(tp_size, tp_rank, qkv_layers, o_layers, embed_w, lm_w,
     trainer._n_heads_local = TOY_HEADS // tp_size
     trainer._n_kv_local = max(1, TOY_KV // tp_size)
     trainer._step = 0
-    trainer.accum_steps = 10 ** 9   # never trigger optimizer_step here
+    trainer.accum_steps = 10**9  # never trigger optimizer_step here
     trainer.completed_steps = 0
     trainer.total_loss = 0.0
     trainer.t_ft = TOY_T
@@ -113,7 +136,9 @@ def _build_trainer(tp_size, tp_rank, qkv_layers, o_layers, embed_w, lm_w,
     trainer._fwd_last_done = 0.0
     trainer._FWD_COOLDOWN_S = 0.0
 
-    layers = [_make_layer(qkv_layers[i], o_layers[i], device) for i in range(TOY_LAYERS)]
+    layers = [
+        _make_layer(qkv_layers[i], o_layers[i], device) for i in range(TOY_LAYERS)
+    ]
     embed = _Embed(embed_w)
     lm_head = types.SimpleNamespace(weight=lm_w)
     trainer._layers = layers
@@ -121,18 +146,21 @@ def _build_trainer(tp_size, tp_rank, qkv_layers, o_layers, embed_w, lm_w,
     trainer._norm = lambda x: x
     trainer._lm_head = lm_head
     trainer._model = types.SimpleNamespace(
-        model=types.SimpleNamespace(layers=layers, embed_tokens=embed, norm=trainer._norm),
+        model=types.SimpleNamespace(
+            layers=layers, embed_tokens=embed, norm=trainer._norm
+        ),
         lm_head=lm_head,
     )
 
     def _get_batch_mock():
         return input_ids.clone(), labels.clone()
+
     trainer._get_batch = _get_batch_mock
 
     # Patch load_file to load the (cpu-saved) adapter, like _make_bare_trainer.
     orig_load = blt.load_file
     try:
-        blt.load_file = lambda p, device: load_file(p, device='cpu')
+        blt.load_file = lambda p, device: load_file(p, device="cpu")
         trainer._load_lora(adapter_path)
     finally:
         blt.load_file = orig_load
@@ -156,17 +184,20 @@ def _run_step(trainer) -> float:
 def _grads(trainer) -> dict:
     out = {}
     for key, p in trainer._lora[LAST_LAYER].items():
-        out[key] = (p.grad.detach().cpu().clone() if p.grad is not None
-                     else torch.zeros_like(p).cpu())
+        out[key] = (
+            p.grad.detach().cpu().clone()
+            if p.grad is not None
+            else torch.zeros_like(p).cpu()
+        )
     return out
 
 
 def _full_grad(g0: dict, g1: dict, key: str) -> torch.Tensor:
     """Reconstruct the TP=1-equivalent gradient from the two ranks' TP=2 grads."""
     if key in ("q_proj.lora_B", "k_proj.lora_B", "v_proj.lora_B"):
-        return torch.cat([g0[key], g1[key]], dim=0)   # row-sharded
+        return torch.cat([g0[key], g1[key]], dim=0)  # row-sharded
     if key == "o_proj.lora_A":
-        return torch.cat([g0[key], g1[key]], dim=1)   # column-sharded
+        return torch.cat([g0[key], g1[key]], dim=1)  # column-sharded
     # Replicated (q/k/v_proj.lora_A, o_proj.lora_B): both ranks should hold
     # the same value once all-reduced.
     return g0[key]
@@ -211,9 +242,11 @@ def _check(results: dict) -> bool:
                 g_diff = (lg - ref_lg).abs().max().item()
             l_match = abs(ll - ref_ll) < 1e-4
             lm_match.append(g_match and l_match)
-            print(f"  {f'lm_head (rank{rk})':18s} match={g_match!s:5}  "
-                  f"max_abs_diff={g_diff:.3e}  "
-                  f"loss={ll:.6f} (ref={ref_ll:.6f}, match={l_match})")
+            print(
+                f"  {f'lm_head (rank{rk})':18s} match={g_match!s:5}  "
+                f"max_abs_diff={g_diff:.3e}  "
+                f"loss={ll:.6f} (ref={ref_ll:.6f}, match={l_match})"
+            )
 
         if tag == "ON":
             if not all_match:
@@ -221,27 +254,37 @@ def _check(results: dict) -> bool:
                 print("  FAIL: expected match with VLLM_FT_TP_CORRECT=1")
             elif not (h0_match and h1_match):
                 ok = False
-                print("  FAIL: expected both ranks' embeddings to match the "
-                       "TP=1 reference with VLLM_FT_TP_CORRECT=1")
+                print(
+                    "  FAIL: expected both ranks' embeddings to match the "
+                    "TP=1 reference with VLLM_FT_TP_CORRECT=1"
+                )
             elif not (lm_match[0] and lm_match[1]):
                 ok = False
-                print("  FAIL: expected both ranks' lm_head grad/loss to match "
-                       "the TP=1 reference with VLLM_FT_TP_CORRECT=1")
+                print(
+                    "  FAIL: expected both ranks' lm_head grad/loss to match "
+                    "the TP=1 reference with VLLM_FT_TP_CORRECT=1"
+                )
             else:
                 print("  PASS")
         else:
             if all_match:
                 ok = False
-                print("  FAIL: expected MISMATCH with VLLM_FT_TP_CORRECT=0 "
-                       "(fix would be vacuous)")
+                print(
+                    "  FAIL: expected MISMATCH with VLLM_FT_TP_CORRECT=0 "
+                    "(fix would be vacuous)"
+                )
             elif h1_match:
                 ok = False
-                print("  FAIL: expected rank 1's embedding to be zeroed "
-                       "(mismatch) with VLLM_FT_TP_CORRECT=0")
+                print(
+                    "  FAIL: expected rank 1's embedding to be zeroed "
+                    "(mismatch) with VLLM_FT_TP_CORRECT=0"
+                )
             elif lm_match[0] or lm_match[1]:
                 ok = False
-                print("  FAIL: expected both ranks' local-shard CE to diverge "
-                       "from the full-vocab reference with VLLM_FT_TP_CORRECT=0")
+                print(
+                    "  FAIL: expected both ranks' local-shard CE to diverge "
+                    "from the full-vocab reference with VLLM_FT_TP_CORRECT=0"
+                )
             else:
                 print("  PASS (mismatch confirmed, as expected without the fix)")
 
@@ -281,12 +324,16 @@ def main() -> None:
         # meaningful.
         SCALE = 0.3
         g = torch.Generator().manual_seed(SEED)
-        qkv_full = [(torch.randn(Q_SZ + 2 * KV_SZ, TOY_H, generator=g) * SCALE).to(device)
-                     for _ in range(TOY_LAYERS)]
-        o_full   = [(torch.randn(TOY_H, Q_SZ, generator=g) * SCALE).to(device)
-                     for _ in range(TOY_LAYERS)]
-        embed_w  = (torch.randn(TOY_VOCAB, TOY_H, generator=g) * SCALE).to(device)
-        lm_w     = (torch.randn(TOY_VOCAB, TOY_H, generator=g) * SCALE).to(device)
+        qkv_full = [
+            (torch.randn(Q_SZ + 2 * KV_SZ, TOY_H, generator=g) * SCALE).to(device)
+            for _ in range(TOY_LAYERS)
+        ]
+        o_full = [
+            (torch.randn(TOY_H, Q_SZ, generator=g) * SCALE).to(device)
+            for _ in range(TOY_LAYERS)
+        ]
+        embed_w = (torch.randn(TOY_VOCAB, TOY_H, generator=g) * SCALE).to(device)
+        lm_w = (torch.randn(TOY_VOCAB, TOY_H, generator=g) * SCALE).to(device)
 
         # ── TP=2 shards for this rank ────────────────────────────────────────
         nh_local, nkv_local = TOY_HEADS // 2, max(1, TOY_KV // 2)
@@ -295,17 +342,21 @@ def main() -> None:
         qkv_local, o_local = [], []
         for i in range(TOY_LAYERS):
             Qf = qkv_full[i][:Q_SZ]
-            Kf = qkv_full[i][Q_SZ:Q_SZ + KV_SZ]
-            Vf = qkv_full[i][Q_SZ + KV_SZ:]
-            Qr = Qf[rank * q_sz_local:(rank + 1) * q_sz_local]
-            Kr = Kf[rank * kv_sz_local:(rank + 1) * kv_sz_local]
-            Vr = Vf[rank * kv_sz_local:(rank + 1) * kv_sz_local]
+            Kf = qkv_full[i][Q_SZ : Q_SZ + KV_SZ]
+            Vf = qkv_full[i][Q_SZ + KV_SZ :]
+            Qr = Qf[rank * q_sz_local : (rank + 1) * q_sz_local]
+            Kr = Kf[rank * kv_sz_local : (rank + 1) * kv_sz_local]
+            Vr = Vf[rank * kv_sz_local : (rank + 1) * kv_sz_local]
             qkv_local.append(torch.cat([Qr, Kr, Vr], dim=0).contiguous())
-            o_local.append(o_full[i][:, rank * q_sz_local:(rank + 1) * q_sz_local].contiguous())
+            o_local.append(
+                o_full[i][:, rank * q_sz_local : (rank + 1) * q_sz_local].contiguous()
+            )
 
         # ── Toy LoRA adapter (same file for TP=1 and TP=2 — _load_lora shards
         #    it per _tp_rank/_tp_size) ────────────────────────────────────────
-        adapter_path = os.path.join(tempfile.gettempdir(), "bt_lora_tp_test_adapter.safetensors")
+        adapter_path = os.path.join(
+            tempfile.gettempdir(), "bt_lora_tp_test_adapter.safetensors"
+        )
         if rank == 0:
             _make_toy_safetensors(adapter_path, nonzero_b=True)
         dist.barrier()
@@ -322,8 +373,9 @@ def main() -> None:
         # both vocab shards own some targets and one position is ignored ─────
         gh = torch.Generator().manual_seed(SEED + 7)
         hidden_lm = (torch.randn(TOY_T, TOY_H, generator=gh) * SCALE).to(device)
-        labels_lm = torch.tensor([[5, 20, 3, -100, 28, 9, 17, 2]],
-                                  dtype=torch.long, device=device)
+        labels_lm = torch.tensor(
+            [[5, 20, 3, -100, 28, 9, 17, 2]], dtype=torch.long, device=device
+        )
         assert labels_lm.shape[1] == TOY_T
         v_half = TOY_VOCAB // 2
 
@@ -331,11 +383,21 @@ def main() -> None:
         for tp_correct in (True, False):
             tag = "ON" if tp_correct else "OFF"
 
-            t2 = _build_trainer(2, rank, qkv_local, o_local, embed_w, lm_w,
-                                 adapter_path, device, input_ids, labels,
-                                 train_tp_pg=train_tp_pg,
-                                 tp_correct_store=tp_correct_store,
-                                 tp_correct=tp_correct)
+            t2 = _build_trainer(
+                2,
+                rank,
+                qkv_local,
+                o_local,
+                embed_w,
+                lm_w,
+                adapter_path,
+                device,
+                input_ids,
+                labels,
+                train_tp_pg=train_tp_pg,
+                tp_correct_store=tp_correct_store,
+                tp_correct=tp_correct,
+            )
             loss2 = _run_step(t2)
             grads2 = _grads(t2)
 
@@ -355,21 +417,40 @@ def main() -> None:
             # after _run_step/_fwd_init so those keep the full lm_w (they
             # rely on a replicated lm_head to match the TP=1 reference).
             t2._lm_head = types.SimpleNamespace(
-                weight=lm_w[rank * v_half:(rank + 1) * v_half].contiguous())
+                weight=lm_w[rank * v_half : (rank + 1) * v_half].contiguous()
+            )
             lm_grad2, lm_loss2 = t2._lm_head_grad(hidden_lm, labels_lm, round_id=7)
             if lm_grad2 is not None:
                 lm_grad2 = lm_grad2.detach().cpu().clone()
 
             gathered: list = [None, None]
             dist.all_gather_object(
-                gathered, {"loss": loss2, "grads": grads2, "hidden": hidden2,
-                            "lm_grad": lm_grad2, "lm_loss": lm_loss2},
-                group=train_tp_pg)
+                gathered,
+                {
+                    "loss": loss2,
+                    "grads": grads2,
+                    "hidden": hidden2,
+                    "lm_grad": lm_grad2,
+                    "lm_loss": lm_loss2,
+                },
+                group=train_tp_pg,
+            )
 
             if rank == 0:
-                t1 = _build_trainer(1, 0, qkv_full, o_full, embed_w, lm_w,
-                                     adapter_path, device, input_ids, labels,
-                                     train_tp_pg=None, tp_correct=False)
+                t1 = _build_trainer(
+                    1,
+                    0,
+                    qkv_full,
+                    o_full,
+                    embed_w,
+                    lm_w,
+                    adapter_path,
+                    device,
+                    input_ids,
+                    labels,
+                    train_tp_pg=None,
+                    tp_correct=False,
+                )
                 loss1 = _run_step(t1)
                 grads1 = _grads(t1)
                 fwd_ops1 = t1.build_fwd_subops()
@@ -378,15 +459,16 @@ def main() -> None:
                 # Item 7 reference: t1 holds the full (unsharded) lm_w, so its
                 # local-shard path is exactly the full-vocab CE.
                 lm_grad1, lm_loss1 = t1._lm_head_grad(hidden_lm, labels_lm)
-                results[tag] = {"ref_loss": loss1, "ref_grads": grads1,
-                                 "ref_hidden": hidden1,
-                                 "ref_lm_grad": lm_grad1.detach().cpu().clone(),
-                                 "ref_lm_loss": lm_loss1, "tp2": gathered}
+                results[tag] = {
+                    "ref_loss": loss1,
+                    "ref_grads": grads1,
+                    "ref_hidden": hidden1,
+                    "ref_lm_grad": lm_grad1.detach().cpu().clone(),
+                    "ref_lm_loss": lm_loss1,
+                    "tp2": gathered,
+                }
 
-        if rank == 0:
-            ok = _check(results)
-        else:
-            ok = True
+        ok = _check(results) if rank == 0 else True
 
     dist.barrier()
     dist.destroy_process_group()

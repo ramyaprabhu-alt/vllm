@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 bt_lora_trainer.py — Real LoRA training for BubbleTea C+D mode.
 
@@ -32,7 +34,6 @@ import queue
 import struct
 import threading
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -40,7 +41,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 if TYPE_CHECKING:
-    import torch.nn as nn
+    pass
 
 log = logging.getLogger(__name__)
 
@@ -52,31 +53,33 @@ log = logging.getLogger(__name__)
 # values overflows to Inf, making rms = Inf and x/rms = Inf/Inf = NaN.
 # Scaling preserves the formula: rms(x) = amax * rms(x/amax), x_hat = x/rms.
 
+
 @torch.no_grad()
 def _rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    x_f  = x.float()
+    x_f = x.float()
     amax = x_f.abs().amax(-1, keepdim=True).clamp(min=1.0)
-    rms  = ((x_f / amax).pow(2).mean(-1, keepdim=True) + eps / amax.pow(2)).sqrt() * amax
+    rms = ((x_f / amax).pow(2).mean(-1, keepdim=True) + eps / amax.pow(2)).sqrt() * amax
     return (x_f / rms * w.float()).to(x.dtype)
 
 
 @torch.no_grad()
-def _rms_norm_bwd_x(grad: torch.Tensor, x: torch.Tensor,
-                    w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _rms_norm_bwd_x(
+    grad: torch.Tensor, x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
     """grad_x only (we don't train the norm weight)."""
-    x_f  = x.float()
+    x_f = x.float()
     amax = x_f.abs().amax(-1, keepdim=True).clamp(min=1.0)
-    rms  = ((x_f / amax).pow(2).mean(-1, keepdim=True) + eps / amax.pow(2)).sqrt() * amax
+    rms = ((x_f / amax).pow(2).mean(-1, keepdim=True) + eps / amax.pow(2)).sqrt() * amax
     x_hat = x_f / rms
-    dxh   = grad.float() * w.float()
-    dx    = (dxh - x_hat * (dxh * x_hat).mean(-1, keepdim=True)) / rms
+    dxh = grad.float() * w.float()
+    dx = (dxh - x_hat * (dxh * x_hat).mean(-1, keepdim=True)) / rms
     return dx.to(x.dtype)
 
 
 # ── Constants (Qwen3-30B-A3B architecture) ─────────────────────────────────
-_HIDDEN   = 2048
-_N_HEADS  = 32
-_N_KV     = 4
+_HIDDEN = 2048
+_N_HEADS = 32
+_N_KV = 4
 _HEAD_DIM = 128
 _N_LAYERS = 48
 _LORA_ALPHA = 16
@@ -87,9 +90,7 @@ _LORA_ALPHA = 16
 # ranks and ensures _sync_to_vllm on the non-updating rank uses current weights.
 # The sync fires on the main CUDA stream inside the model forward(), where both
 # TP ranks are guaranteed to participate — no deadlock risk.
-_SYNC_LORA_PARAMS: bool = (
-    os.environ.get("VLLM_FT_SYNC_LORA_PARAMS", "0") == "1"
-)
+_SYNC_LORA_PARAMS: bool = os.environ.get("VLLM_FT_SYNC_LORA_PARAMS", "0") == "1"
 
 # Set VLLM_FT_TP_CORRECT=1 to enable TP-correct attention-LoRA training:
 #   - all-reduce the row-parallel O-projection LoRA output in
@@ -106,11 +107,13 @@ _TP_CORRECT: bool = os.environ.get("VLLM_FT_TP_CORRECT", "0") == "1"
 # isn't published within this window, we fall back to the local (uncorrected)
 # value instead of blocking, and never wait longer than this. Tune based on
 # observed cross-rank skew.
-_TP_CORRECT_TIMEOUT_MS: int = int(os.environ.get("VLLM_FT_TP_CORRECT_TIMEOUT_MS", "50"))
+_TP_CORRECT_TIMEOUT_MS: int = int(
+    os.environ.get("VLLM_FT_TP_CORRECT_TIMEOUT_MS", "500")
+)
 
 # Wire format for _tp_correct_exchange_sum's per-round header: a single
 # little-endian int64 round id, prepended to the raw float32 tensor bytes.
-_TP_CORRECT_HDR = struct.Struct('<q')
+_TP_CORRECT_HDR = struct.Struct("<q")
 
 # Max bytes per TCPStore key for the VLLM_FT_TP_CORRECT exchange. The store's
 # libuv backend hard-rejects messages over 8 MB and kills the client socket
@@ -145,17 +148,17 @@ class _TpCorrectFuture:
     def __init__(self, local: torch.Tensor):
         self._local = local
         self._evt = threading.Event()
-        self._total: "torch.Tensor | None" = None
+        self._total: torch.Tensor | None = None
 
     @classmethod
-    def preset(cls, local: torch.Tensor) -> "_TpCorrectFuture":
+    def preset(cls, local: torch.Tensor) -> _TpCorrectFuture:
         """Already-resolved-to-local future, used when the exchange is
         disabled/gated off so consumers have a single code path."""
         fut = cls(local)
         fut._evt.set()
         return fut
 
-    def _set(self, total_cpu: "torch.Tensor | None") -> None:
+    def _set(self, total_cpu: torch.Tensor | None) -> None:
         self._total = total_cpu
         self._evt.set()
 
@@ -164,12 +167,17 @@ class _TpCorrectFuture:
             return self._local
         return self._total.to(self._local.device, dtype=self._local.dtype)
 
+
 # LoRA tensors that are TP-replicated (identical full matrix on every rank):
 # lora_A for colwise Q/K/V projections, lora_B for rowwise O projection.
-_REPLICATED_LORA_KEYS = ('q_proj.lora_A', 'k_proj.lora_A',
-                         'v_proj.lora_A', 'o_proj.lora_B')
+_REPLICATED_LORA_KEYS = (
+    "q_proj.lora_A",
+    "k_proj.lora_A",
+    "v_proj.lora_A",
+    "o_proj.lora_B",
+)
 
-import torch.distributed as dist
+import torch.distributed as dist  # noqa: E402
 
 
 class _SumAllReduce(torch.autograd.Function):
@@ -196,6 +204,7 @@ class _SumAllReduce(torch.autograd.Function):
 
 
 # ── BubbleTeaLoRATrainer ──────────────────────────────────────────────────
+
 
 class BubbleTeaLoRATrainer:
     """
@@ -228,9 +237,9 @@ class BubbleTeaLoRATrainer:
         ep_expert_start: int = 0,
         ep_num_local_experts: int = 64,
     ):
-        self.device     = device
+        self.device = device
         self.accum_steps = accum_steps
-        self.t_ft       = t_ft
+        self.t_ft = t_ft
         # Number of expert-group chunks to split each _passthrough sub-op into.
         # Each chunk handles (n_local_experts / n_chunks) experts and reads only
         # that fraction of the expert weight matrices — small enough to complete
@@ -238,25 +247,26 @@ class BubbleTeaLoRATrainer:
         self._bwd_passthrough_chunks: int = int(
             os.environ.get("VLLM_FT_BWD_PASSTHROUGH_CHUNKS", "8")
         )
-        self._step      = 0          # gradient-accumulation steps so far
-        self.completed_steps = 0     # optimizer steps applied
-        self.total_loss  = 0.0       # accumulated loss for logging
+        self._step = 0  # gradient-accumulation steps so far
+        self.completed_steps = 0  # optimizer steps applied
+        self.total_loss = 0.0  # accumulated loss for logging
         self._lock = threading.Lock()
 
         # ── Base model layers (read-only references) ──────────────────────
-        self._model   = model
-        inner = model.model                          # Qwen3MoeModel
-        self._layers  = inner.layers                 # nn.ModuleList[DecoderLayer]
-        self._embed   = inner.embed_tokens           # VocabParallelEmbedding
-        self._norm    = inner.norm                   # RMSNorm
-        self._lm_head = model.lm_head                # ParallelLMHead
+        self._model = model
+        inner = model.model  # Qwen3MoeModel
+        self._layers = inner.layers  # nn.ModuleList[DecoderLayer]
+        self._embed = inner.embed_tokens  # VocabParallelEmbedding
+        self._norm = inner.norm  # RMSNorm
+        self._lm_head = model.lm_head  # ParallelLMHead
 
         # TP info
         from vllm.distributed.parallel_state import (
-            get_tensor_model_parallel_world_size,
             get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
             get_tp_group,
         )
+
         self._tp_size = get_tensor_model_parallel_world_size()
         self._tp_rank = get_tensor_model_parallel_rank()
         self._tp_group = get_tp_group()
@@ -271,18 +281,21 @@ class BubbleTeaLoRATrainer:
         self._train_tp_pg = None
         if self._tp_size > 1:
             try:
-                dist.barrier()   # synchronise before new_group (collective op)
+                dist.barrier()  # synchronise before new_group (collective op)
                 self._train_tp_pg = dist.new_group(
                     ranks=list(range(dist.get_world_size())),
-                    backend='nccl',
+                    backend="nccl",
                 )
-                log.debug("[BubbleTea] training TP process group created (tp_size=%d)",
-                          self._tp_size)
+                log.debug(
+                    "[BubbleTea] training TP process group created (tp_size=%d)",
+                    self._tp_size,
+                )
             except Exception as _e:
                 log.warning(
                     "[BubbleTea] Training TP process group creation failed (%s). "
                     "Training will proceed without TP communication — gradients "
-                    "will be incorrect in multi-GPU mode.", _e,
+                    "will be incorrect in multi-GPU mode.",
+                    _e,
                 )
 
         # Store-based exchange used only by the VLLM_FT_TP_CORRECT production
@@ -303,7 +316,8 @@ class BubbleTeaLoRATrainer:
                 log.warning(
                     "[BubbleTea] Could not obtain default store for "
                     "VLLM_FT_TP_CORRECT exchange (%s). VLLM_FT_TP_CORRECT "
-                    "will be disabled.", _e,
+                    "will be disabled.",
+                    _e,
                 )
 
         # Per-rank counter of forward training rounds started (incremented in
@@ -317,36 +331,45 @@ class BubbleTeaLoRATrainer:
         # Param sync: set True after each optimizer step; cleared by
         # sync_replicated_params() which runs on the main CUDA stream where
         # both TP ranks are guaranteed to participate together.
-        self._do_param_sync    = _SYNC_LORA_PARAMS and (self._tp_size > 1) and (self._train_tp_pg is not None)
+        self._do_param_sync = (
+            _SYNC_LORA_PARAMS
+            and (self._tp_size > 1)
+            and (self._train_tp_pg is not None)
+        )
         self._pending_param_sync = False
 
         # See _TP_CORRECT above. Gates the O-proj all-reduce in
         # _attn_lora_forward and the replicated-grad all-reduce in
         # optimizer_step().
         self._tp_correct = (
-            _TP_CORRECT and (self._tp_size > 1)
+            _TP_CORRECT
+            and (self._tp_size > 1)
             and (self._train_tp_pg is not None)
             and (self._tp_correct_store is not None)
         )
 
         # EP expert info for _training_moe_forward
-        self._ep_rank              = ep_rank
-        self._ep_size              = ep_size
-        self._ep_expert_start      = ep_expert_start
+        self._ep_rank = ep_rank
+        self._ep_size = ep_size
+        self._ep_expert_start = ep_expert_start
         self._ep_num_local_experts = ep_num_local_experts
 
-        # Per-rank head counts
-        self._n_heads_local  = _N_HEADS // self._tp_size
-        self._n_kv_local     = max(1, _N_KV // self._tp_size)
+        # Per-rank head counts — read from the first attention layer so the
+        # trainer works for any MoE architecture (Qwen3: 32Q/4KV, Qwen1.5-MoE: 16Q/8KV).
+        _first_attn = inner.layers[0].self_attn
+        self._n_heads_local = getattr(
+            _first_attn, "num_heads", _N_HEADS // self._tp_size
+        )
+        self._n_kv_local = getattr(
+            _first_attn, "num_kv_heads", max(1, _N_KV // self._tp_size)
+        )
 
         # ── LoRA parameters ───────────────────────────────────────────────
         self._lora: dict[int, dict[str, torch.Tensor]] = {}  # layer -> proj -> tensor
         self._load_lora(adapter_path)
 
         # ── Optimizer ─────────────────────────────────────────────────────
-        all_params = [
-            p for layer_d in self._lora.values() for p in layer_d.values()
-        ]
+        all_params = [p for layer_d in self._lora.values() for p in layer_d.values()]
         self.optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=0.01)
 
         # ── Training data (lazy background init) ──────────────────────────────
@@ -355,12 +378,12 @@ class BubbleTeaLoRATrainer:
         # during decode steps — never during the memory-profiling run.
         # Starting the thread during __init__ (called from load_weights) races
         # with the EngineCore's profiling RPC and causes a 60-second timeout.
-        self._data_iter:           object = None
-        self._data_ready                  = threading.Event()
-        self._data_thread_started: bool   = False
-        self._tokenizer_path              = tokenizer_path
-        self._cache_dir                   = cache_dir
-        self._next_batch: dict | None     = None    # pre-fetched
+        self._data_iter: object = None
+        self._data_ready = threading.Event()
+        self._data_thread_started: bool = False
+        self._tokenizer_path = tokenizer_path
+        self._cache_dir = cache_dir
+        self._next_batch: dict | None = None  # pre-fetched
 
         # Non-reentrant lock that prevents concurrent _real_fwd() executions.
         # The pre-data-ready fwd/bwd cycle runs at inference speed (dozens/s).
@@ -391,12 +414,12 @@ class BubbleTeaLoRATrainer:
         self._fwd: dict = {}
 
         import warnings as _w
+
+        n_params = sum(p.numel() for p in all_params)
         _w.warn(
-            "[BubbleTea LoRA] Trainer ready – %d trainable params, device=%d, "
-            "tp=%d/%d, accum=%d, t_ft=%d" % (
-                sum(p.numel() for p in all_params),
-                device, self._tp_rank + 1, self._tp_size, accum_steps, t_ft,
-            ),
+            f"[BubbleTea LoRA] Trainer ready – {n_params} trainable params, "
+            f"device={device}, tp={self._tp_rank + 1}/{self._tp_size}, "
+            f"accum={accum_steps}, t_ft={t_ft}",
             stacklevel=2,
         )
 
@@ -411,13 +434,13 @@ class BubbleTeaLoRATrainer:
         """Load safetensors LoRA weights as float32 nn.Parameters."""
         weights = load_file(adapter_path, device=f"cuda:{self.device}")
         for key, tensor in weights.items():
-            # key: "base_model.model.model.layers.{i}.self_attn.{proj}.lora_{A/B}.weight"
-            # idx:   [0]       [1]   [2]   [3]   [4]   [5]      [6]    [7]       [8]
+            # key: "base_model.model.model.layers.{i}.self_attn.{proj}.lora_X.weight"
+            # idx:   [0]       [1]   [2]   [3]   [4]   [5]      [6]    [7]      [8]
             parts = key.split(".")
             try:
                 layer_idx = int(parts[4])
-                proj      = parts[6]   # q_proj / k_proj / v_proj / o_proj
-                ab        = parts[7]   # lora_A / lora_B
+                proj = parts[6]  # q_proj / k_proj / v_proj / o_proj
+                ab = parts[7]  # lora_A / lora_B
             except (IndexError, ValueError):
                 continue
 
@@ -436,7 +459,9 @@ class BubbleTeaLoRATrainer:
             elif ab == "lora_A" and proj == "o_proj":
                 # Row-parallel: shard A along input (columns).
                 chunk = t.shape[1] // self._tp_size
-                t = t[:, self._tp_rank * chunk : (self._tp_rank + 1) * chunk].contiguous()
+                t = t[
+                    :, self._tp_rank * chunk : (self._tp_rank + 1) * chunk
+                ].contiguous()
 
             self._lora[layer_idx][param_key] = t.requires_grad_(True)
 
@@ -450,27 +475,39 @@ class BubbleTeaLoRATrainer:
         hook but is effectively a no-op.
         """
         import warnings as _w
+
         _w.warn(
             "[BubbleTea LoRA] warmup: pure-PyTorch MoE — no Triton to compile",
             stacklevel=2,
         )
         try:
             dummy = torch.zeros(
-                1, 1, device=f"cuda:{self.device}", dtype=torch.float32,
+                1,
+                1,
+                device=f"cuda:{self.device}",
+                dtype=torch.float32,
                 requires_grad=True,
             )
             dummy.sum().backward()
             self.optimizer.zero_grad(set_to_none=True)
         except Exception as exc:
-            _w.warn("[BubbleTea LoRA] warmup error (non-fatal): %s" % exc, stacklevel=2)
+            _w.warn(f"[BubbleTea LoRA] warmup error (non-fatal): {exc}", stacklevel=2)
         _w.warn("[BubbleTea LoRA] warmup complete", stacklevel=2)
 
     def _build_data_iter_bg(self, tokenizer_path: str, cache_dir: str) -> None:
         """Background thread: download + tokenise dataset, then signal ready."""
         try:
             self._data_iter = self._make_data_iter(tokenizer_path, cache_dir)
-            log.info("[BubbleTea LoRA] data iterator ready")
+            import warnings as _w
+
+            _w.warn("[BubbleTea LoRA] training data ready", stacklevel=1)
         except Exception as exc:
+            import warnings as _w
+
+            _w.warn(
+                f"[BubbleTea LoRA] data iterator init FAILED: {exc}",
+                stacklevel=1,
+            )
             log.error("[BubbleTea LoRA] data iterator init failed: %s", exc)
         finally:
             self._data_ready.set()
@@ -493,7 +530,7 @@ class BubbleTeaLoRATrainer:
         )
         tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
         pad_id = tokenizer.pad_token_id or 0
-        t_ft   = self.t_ft
+        t_ft = self.t_ft
 
         def _fmt(s) -> str:
             if s.get("input", "").strip():
@@ -503,8 +540,7 @@ class BubbleTeaLoRATrainer:
                     f"### Response:\n{s['output']}"
                 )
             return (
-                f"### Instruction:\n{s['instruction']}\n\n"
-                f"### Response:\n{s['output']}"
+                f"### Instruction:\n{s['instruction']}\n\n### Response:\n{s['output']}"
             )
 
         # HF_DATASETS_OFFLINE=1 must be set in the server environment so this
@@ -513,7 +549,9 @@ class BubbleTeaLoRATrainer:
         # Python GIL in this background thread, hanging the vLLM worker's
         # main loop.  Run download_alpaca.py once to populate the cache.
         ds_train = datasets.load_dataset(
-            "yahma/alpaca-cleaned", cache_dir=cache_dir, split="train",
+            "yahma/alpaca-cleaned",
+            cache_dir=cache_dir,
+            split="train",
         )
 
         def _gen():
@@ -525,9 +563,9 @@ class BubbleTeaLoRATrainer:
                     max_length=t_ft,
                     return_tensors="pt",
                 )
-                ids    = enc["input_ids"]           # [1, T]
+                ids = enc["input_ids"]  # [1, T]
                 labels = ids.clone()
-                labels[ids == pad_id] = -100        # mask padding
+                labels[ids == pad_id] = -100  # mask padding
                 yield {"input_ids": ids, "labels": labels}
 
         return _gen()
@@ -541,7 +579,7 @@ class BubbleTeaLoRATrainer:
         if self._data_iter is None:
             raise RuntimeError("[BubbleTea LoRA] data iterator not ready")
         batch = next(self._data_iter)
-        ids    = batch["input_ids"].to(f"cuda:{self.device}")
+        ids = batch["input_ids"].to(f"cuda:{self.device}")
         labels = batch["labels"].to(f"cuda:{self.device}")
         return ids, labels
 
@@ -553,9 +591,8 @@ class BubbleTeaLoRATrainer:
         Gradients are accumulated.  Call optimizer_step() every accum_steps.
         Returns the scalar loss value.
         """
-        with torch.inference_mode(False):
-            with torch.enable_grad():
-                loss = self._forward_loss()
+        with torch.inference_mode(False), torch.enable_grad():
+            loss = self._forward_loss()
         loss.backward()
         loss_val = loss.item()
         self.total_loss += loss_val
@@ -586,6 +623,13 @@ class BubbleTeaLoRATrainer:
         avg_loss = self.total_loss / max(self.accum_steps, 1)
         self.total_loss = 0.0
         log.debug("[BubbleTea LoRA] step %d  loss=%.4f", self.completed_steps, avg_loss)
+        import warnings as _w
+
+        _w.warn(
+            f"[BubbleTea LoRA] training step {self.completed_steps}"
+            f"  loss={avg_loss:.4f}  device={self.device}",
+            stacklevel=1,
+        )
 
         # Write completion timestamp to the same log that _parse_bt_completions reads
         try:
@@ -660,8 +704,11 @@ class BubbleTeaLoRATrainer:
         return out
 
     def _tp_correct_exchange_gather(
-        self, t: torch.Tensor, tag: str, round_id: int,
-    ) -> "list[torch.Tensor] | None":
+        self,
+        t: torch.Tensor,
+        tag: str,
+        round_id: int,
+    ) -> list[torch.Tensor] | None:
         """Publish `t` and collect every peer TP rank's tensor (same shape +
         dtype) via the default rendezvous TCPStore — the building block for
         the VLLM_FT_TP_CORRECT production exchanges
@@ -700,12 +747,15 @@ class BubbleTeaLoRATrainer:
         if self._tp_correct_store is None:
             return None
         try:
-            cpu_t = t.detach().to('cpu').contiguous()
+            cpu_t = t.detach().to("cpu").contiguous()
             n_chunks = self._tp_correct_publish(cpu_t, tag, round_id)
             return self._tp_correct_collect(cpu_t, tag, round_id, n_chunks)
         except Exception as e:
-            log.warning("[BubbleTea] TP-correct exchange timed out/failed "
-                         "(%s); using local value for this round.", e)
+            log.warning(
+                "[BubbleTea] TP-correct exchange timed out/failed "
+                "(%s); using local value for this round.",
+                e,
+            )
             return None
 
     def _tp_correct_publish(self, cpu_t: torch.Tensor, tag: str, round_id: int) -> int:
@@ -716,18 +766,24 @@ class BubbleTeaLoRATrainer:
         n_chunks = max(1, -(-len(raw) // _TP_CORRECT_MAX_CHUNK))
         hdr = _TP_CORRECT_HDR.pack(round_id)
         for j in range(n_chunks):
-            chunk = raw[j * _TP_CORRECT_MAX_CHUNK:(j + 1) * _TP_CORRECT_MAX_CHUNK]
+            chunk = raw[j * _TP_CORRECT_MAX_CHUNK : (j + 1) * _TP_CORRECT_MAX_CHUNK]
             self._tp_correct_store.set(
-                f"tpcorrect/{tag}/{self._tp_rank}/{j}", hdr + chunk)
+                f"tpcorrect/{tag}/{self._tp_rank}/{j}", hdr + chunk
+            )
         return n_chunks
 
     def _tp_correct_collect(
-        self, cpu_t: torch.Tensor, tag: str, round_id: int, n_chunks: int,
-    ) -> "list[torch.Tensor] | None":
+        self,
+        cpu_t: torch.Tensor,
+        tag: str,
+        round_id: int,
+        n_chunks: int,
+    ) -> list[torch.Tensor] | None:
         """Collect every peer's chunks for (tag, round_id); None on
         round-mismatch. May raise on store timeout; callers handle fallback."""
         store = self._tp_correct_store
         timeout = datetime.timedelta(milliseconds=_TP_CORRECT_TIMEOUT_MS)
+        timeout_s = _TP_CORRECT_TIMEOUT_MS / 1000.0
         peers: list[torch.Tensor] = []
         for r in range(self._tp_size):
             if r == self._tp_rank:
@@ -737,12 +793,28 @@ class BubbleTeaLoRATrainer:
                 peer_key = f"tpcorrect/{tag}/{r}/{j}"
                 store.wait([peer_key], timeout)
                 buf = store.get(peer_key)
-                peer_round, = _TP_CORRECT_HDR.unpack(buf[:_TP_CORRECT_HDR.size])
+                (peer_round,) = _TP_CORRECT_HDR.unpack(buf[: _TP_CORRECT_HDR.size])
                 if peer_round != round_id:
-                    return None
-                parts.append(buf[_TP_CORRECT_HDR.size:])
-            peers.append(torch.frombuffer(bytearray(b"".join(parts)),
-                                          dtype=cpu_t.dtype).reshape(cpu_t.shape))
+                    # Key exists but holds data from a different round: the peer
+                    # may not have published this round yet (publish-before-collect
+                    # race).  Poll get() until the round_id matches or timeout.
+                    deadline = time.monotonic() + timeout_s
+                    while time.monotonic() < deadline:
+                        time.sleep(0.001)
+                        buf = store.get(peer_key)
+                        (peer_round,) = _TP_CORRECT_HDR.unpack(
+                            buf[: _TP_CORRECT_HDR.size]
+                        )
+                        if peer_round == round_id:
+                            break
+                    else:
+                        return None  # peer is on a genuinely different round
+                parts.append(buf[_TP_CORRECT_HDR.size :])
+            peers.append(
+                torch.frombuffer(bytearray(b"".join(parts)), dtype=cpu_t.dtype).reshape(
+                    cpu_t.shape
+                )
+            )
         return peers
 
     # ── Async exchange: publish on the caller, collect on an I/O thread ────
@@ -754,7 +826,8 @@ class BubbleTeaLoRATrainer:
         if q is None:
             q = self._xchg_queue = queue.SimpleQueue()
             self._xchg_thread = threading.Thread(
-                target=self._xchg_worker, name="bt-tpcorrect-io", daemon=True)
+                target=self._xchg_worker, name="bt-tpcorrect-io", daemon=True
+            )
             self._xchg_thread.start()
         q.put(job)
 
@@ -763,11 +836,14 @@ class BubbleTeaLoRATrainer:
             job = self._xchg_queue.get()
             try:
                 job()
-            except Exception as e:   # job() sets its future; this is a backstop
+            except Exception as e:  # job() sets its future; this is a backstop
                 log.warning("[BubbleTea] TP-correct async job error: %s", e)
 
     def _tp_correct_exchange_sum_async(
-        self, t: torch.Tensor, tag: str, round_id: int,
+        self,
+        t: torch.Tensor,
+        tag: str,
+        round_id: int,
     ) -> _TpCorrectFuture:
         """Async all-reduce-sum: publish the local value NOW (synchronously,
         so the peer's collect is never delayed by our queue), run the peer
@@ -778,16 +854,22 @@ class BubbleTeaLoRATrainer:
         inside one sub-op. result() falls back to the local value on
         timeout/round-mismatch/failure (same semantics as the sync path).
         """
-        if (not getattr(self, "_tp_correct", False) or self._tp_size <= 1
-                or self._tp_correct_store is None):
+        if (
+            not getattr(self, "_tp_correct", False)
+            or self._tp_size <= 1
+            or self._tp_correct_store is None
+        ):
             return _TpCorrectFuture.preset(t)
         fut = _TpCorrectFuture(t)
         try:
-            cpu_t = t.detach().to('cpu').contiguous()
+            cpu_t = t.detach().to("cpu").contiguous()
             n_chunks = self._tp_correct_publish(cpu_t, tag, round_id)
         except Exception as e:
-            log.warning("[BubbleTea] TP-correct async publish failed (%s); "
-                         "using local value for this round.", e)
+            log.warning(
+                "[BubbleTea] TP-correct async publish failed (%s); "
+                "using local value for this round.",
+                e,
+            )
             fut._set(None)
             return fut
 
@@ -803,14 +885,19 @@ class BubbleTeaLoRATrainer:
                     total += peer_t.to(torch.float32)
                 fut._set(total)
             except Exception as e:
-                log.warning("[BubbleTea] TP-correct async collect failed "
-                             "(%s); using local value for this round.", e)
+                log.warning(
+                    "[BubbleTea] TP-correct async collect failed "
+                    "(%s); using local value for this round.",
+                    e,
+                )
                 fut._set(None)
 
         self._xchg_submit(_collect_job)
         return fut
 
-    def _tp_correct_exchange_sum(self, t: torch.Tensor, tag: str, round_id: int) -> torch.Tensor:
+    def _tp_correct_exchange_sum(
+        self, t: torch.Tensor, tag: str, round_id: int
+    ) -> torch.Tensor:
         """All-reduce-sum `t` across TP ranks via _tp_correct_exchange_gather
         (TCPStore-based, bounded timeout), accumulating in float32 and
         returning in `t`'s dtype. Production call sites: _attn_lora_forward's
@@ -822,19 +909,22 @@ class BubbleTeaLoRATrainer:
         approximation for this one call.
         """
         peers = self._tp_correct_exchange_gather(t, tag, round_id)
-        if not peers:   # None (fallback) or empty (tp_size == 1)
+        if not peers:  # None (fallback) or empty (tp_size == 1)
             return t
-        total = t.detach().to('cpu', dtype=torch.float32).contiguous().clone()
+        total = t.detach().to("cpu", dtype=torch.float32).contiguous().clone()
         for peer_t in peers:
             total += peer_t.to(torch.float32)
         return total.to(t.device, dtype=t.dtype)
 
-    # Streamed per-layer replicated keys. k_proj.lora_A is replicated too,
-    # but the K gradient path is dropped by design (K has no LoRA in the
-    # forward), so its grad is structurally always None — excluded from the
-    # stream. The packed-sync fallback below still covers all
-    # _REPLICATED_LORA_KEYS.
-    _STREAMED_LORA_KEYS = ('q_proj.lora_A', 'v_proj.lora_A', 'o_proj.lora_B')
+    # Streamed per-layer replicated keys: lora_A for column-parallel Q/K/V,
+    # lora_B for row-parallel O.  Published immediately after the O-LoRA
+    # sub-op so the exchange runs behind the next layer's passthrough chunks.
+    _STREAMED_LORA_KEYS = (
+        "q_proj.lora_A",
+        "k_proj.lora_A",
+        "v_proj.lora_A",
+        "o_proj.lora_B",
+    )
 
     @torch.no_grad()
     def _publish_layer_grads(self, layer_idx: int) -> None:
@@ -851,12 +941,13 @@ class BubbleTeaLoRATrainer:
         params = [d[k] for k in self._STREAMED_LORA_KEYS if k in d]
         if not params:
             return
-        flat = torch.cat([
-            (p.grad if p.grad is not None else torch.zeros_like(p)).view(-1).float()
-            for p in params
-        ])
-        fut = self._tp_correct_exchange_sum_async(
-            flat, f"grad_{layer_idx}", self._step)
+        flat = torch.cat(
+            [
+                (p.grad if p.grad is not None else torch.zeros_like(p)).view(-1).float()
+                for p in params
+            ]
+        )
+        fut = self._tp_correct_exchange_sum_async(flat, f"grad_{layer_idx}", self._step)
         futs = getattr(self, "_pending_grad_futs", None)
         if futs is None:
             futs = self._pending_grad_futs = {}
@@ -900,7 +991,7 @@ class BubbleTeaLoRATrainer:
                 offset = 0
                 for p in params:
                     n = p.numel()
-                    g = flat[offset:offset + n].view_as(p).to(p.dtype)
+                    g = flat[offset : offset + n].view_as(p).to(p.dtype)
                     if p.grad is None:
                         p.grad = g
                     else:
@@ -914,20 +1005,99 @@ class BubbleTeaLoRATrainer:
         params = self._replicated_lora_params()
         if not params:
             return
-        flat = torch.cat([
-            (p.grad if p.grad is not None else torch.zeros_like(p)).view(-1).float()
-            for p in params
-        ])
+        flat = torch.cat(
+            [
+                (p.grad if p.grad is not None else torch.zeros_like(p)).view(-1).float()
+                for p in params
+            ]
+        )
         flat = self._tp_correct_exchange_sum(flat, "grad", self._step)
         offset = 0
         for p in params:
             n = p.numel()
-            g = flat[offset:offset + n].view_as(p).to(p.dtype)
+            g = flat[offset : offset + n].view_as(p).to(p.dtype)
             if p.grad is None:
                 p.grad = g
             else:
                 p.grad.copy_(g)
             offset += n
+
+    # ── Forward-round rendezvous ─────────────────────────────────────────────
+
+    def _sync_fwd_round(self) -> bool:
+        """Rendezvous both TP ranks to the same _fwd_round before training.
+
+        The two TP workers advance _fwd_round independently: whichever rank
+        sees lighter expert traffic finishes each training cycle faster and
+        pulls ahead.  When they diverge the TP-correct exchange keys don't
+        match and every TCPStore collect times out, silently setting
+        bwd_state["ok"]=False and blocking the optimizer step.
+
+        Both ranks publish their current round to "bt_rndz/{rank}" and poll
+        until the peer has caught up.  The lagging rank jumps to the faster
+        rank's value so they converge in one iteration.  Gracefully falls back
+        (returns True) when TP-correct is disabled or the store is unavailable.
+
+        Returns True when both ranks are on the same round, False on timeout.
+        Caller must release _fwd_running and set _fwd_layer_state=None on False.
+        """
+        if not (
+            self._tp_correct
+            and self._tp_size == 2
+            and self._tp_correct_store is not None
+        ):
+            return True
+
+        import time as _t
+        from datetime import timedelta as _td
+
+        my_key = f"bt_rndz/{self._tp_rank}"
+        peer_key = f"bt_rndz/{1 - self._tp_rank}"
+
+        try:
+            self._tp_correct_store.set(my_key, str(self._fwd_round).encode())
+        except Exception as _e:
+            log.debug("[BubbleTea] rndz publish failed: %s", _e)
+            return True  # store unavailable; proceed unsynchronised
+
+        deadline = _t.time() + 2.0
+        while _t.time() < deadline:
+            try:
+                # wait() returns immediately after the first round (key exists).
+                self._tp_correct_store.wait([peer_key], _td(milliseconds=50))
+                peer_round = int(self._tp_correct_store.get(peer_key))
+            except Exception:
+                _t.sleep(0.005)
+                continue
+
+            if peer_round == self._fwd_round:
+                return True
+
+            if peer_round > self._fwd_round:
+                # Jump to the faster rank's round and republish.
+                self._fwd_round = peer_round
+                try:
+                    self._tp_correct_store.set(my_key, str(self._fwd_round).encode())
+                except Exception:
+                    return True
+                continue  # immediately re-check; peer may already be satisfied
+
+            # Peer is behind; it will jump to our round on its next poll.
+            _t.sleep(0.005)
+
+        import warnings as _w
+
+        _w.warn(
+            f"[BubbleTea LoRA] rndz timed out after 2s"
+            f" (rank={self._tp_rank} round={self._fwd_round})",
+            stacklevel=1,
+        )
+        log.debug(
+            "[BubbleTea] rndz timed out after 2s (rank=%d round=%d)",
+            self._tp_rank,
+            self._fwd_round,
+        )
+        return False
 
     # ── Replicated-param sync (main CUDA stream, both TP ranks) ─────────────
 
@@ -953,7 +1123,7 @@ class BubbleTeaLoRATrainer:
         if not self._do_param_sync or self._train_tp_pg is None:
             return
 
-        dev = torch.device(f'cuda:{self.device}')
+        dev = torch.device(f"cuda:{self.device}")
 
         # Cheap coordination: one int32 all-reduce to check if any rank has
         # a pending sync.  Both ranks call this every forward() — it costs
@@ -990,7 +1160,7 @@ class BubbleTeaLoRATrainer:
         offset = 0
         for p in params:
             n = p.numel()
-            p.data.copy_(flat[offset:offset + n].view_as(p.data).to(p.dtype))
+            p.data.copy_(flat[offset : offset + n].view_as(p.data).to(p.dtype))
             offset += n
 
         self._pending_param_sync = False
@@ -1003,12 +1173,13 @@ class BubbleTeaLoRATrainer:
             self._sync_to_vllm()
             log.debug(
                 "[BubbleTea] synced replicated LoRA params from optimizer rank "
-                "(tp_rank=%d received)", self._tp_rank
+                "(tp_rank=%d received)",
+                self._tp_rank,
             )
         else:
             log.debug(
-                "[BubbleTea] synced replicated LoRA params to peer "
-                "(tp_rank=%d sent)", self._tp_rank
+                "[BubbleTea] synced replicated LoRA params to peer (tp_rank=%d sent)",
+                self._tp_rank,
             )
 
     # ── Manual backward helpers ───────────────────────────────────────────
@@ -1016,9 +1187,9 @@ class BubbleTeaLoRATrainer:
     @torch.no_grad()
     def _lm_head_grad(
         self,
-        hidden_last: torch.Tensor,   # [T, H]
-        labels: torch.Tensor,        # [1, T] int64
-        round_id: "int | None" = None,
+        hidden_last: torch.Tensor,  # [T, H]
+        labels: torch.Tensor,  # [1, T] int64
+        round_id: int | None = None,
         async_grad: bool = False,
     ) -> tuple:
         """CE loss and gradient seed for the manual backward sweep.
@@ -1058,49 +1229,55 @@ class BubbleTeaLoRATrainer:
         hidden_last (stamped into trainer._fwd["round"]); defaults to the
         current _fwd_round.
         """
+
         def _ret(g, loss, fut=None):
             return (g, loss, fut) if async_grad else (g, loss)
 
-        lm_w = self._lm_head.weight.detach().float()   # [vocab_local, H]
-        logits_local = hidden_last.float() @ lm_w.T    # [T, vocab_local]
+        lm_w = self._lm_head.weight.detach().float()  # [vocab_local, H]
+        logits_local = hidden_last.float() @ lm_w.T  # [T, vocab_local]
 
         shift_logits = logits_local[:-1].contiguous()  # [T-1, vocab_local]
-        shift_labels = labels.squeeze(0)[1:].long()    # [T-1]
+        shift_labels = labels.squeeze(0)[1:].long()  # [T-1]
 
         vocab_local = lm_w.shape[0]
-        v_start     = self._tp_rank * vocab_local
+        v_start = self._tp_rank * vocab_local
 
         # Global validity (same on every TP rank — identical labels per round)
-        valid   = (shift_labels != -100)               # [T-1]
+        valid = shift_labels != -100  # [T-1]
         n_valid = valid.sum().item()
         if n_valid == 0:
             return _ret(None, 0.0)
 
         # Tokens whose label falls inside this rank's vocab shard.
-        owned     = valid & (shift_labels >= v_start) & (shift_labels < v_start + vocab_local)
-        owned_idx = shift_labels[owned] - v_start      # local column index
+        owned = (
+            valid & (shift_labels >= v_start) & (shift_labels < v_start + vocab_local)
+        )
+        owned_idx = shift_labels[owned] - v_start  # local column index
 
         if self._tp_correct and self._tp_size > 1:
             rid = round_id if round_id is not None else self._fwd_round
-            local_max    = shift_logits.max(dim=-1).values                       # [T-1]
+            local_max = shift_logits.max(dim=-1).values  # [T-1]
             local_sumexp = torch.exp(shift_logits - local_max[:, None]).sum(-1)  # [T-1]
-            label_logit  = torch.zeros_like(local_max)
+            label_logit = torch.zeros_like(local_max)
             label_logit[owned] = shift_logits[owned, owned_idx]
-            stats = torch.stack([local_max, local_sumexp, label_logit])          # [3, T-1]
+            stats = torch.stack([local_max, local_sumexp, label_logit])  # [3, T-1]
             peer_stats = self._tp_correct_exchange_gather(stats, "lmh_stats", rid)
             if peer_stats is not None:
-                all_stats  = [stats] + [p.to(stats.device) for p in peer_stats]
+                all_stats = [stats] + [p.to(stats.device) for p in peer_stats]
                 global_max = torch.stack([s[0] for s in all_stats]).max(dim=0).values
                 # Each rank's sum_exp is relative to its own local max —
                 # rescale to the global max before summing shards.
                 sum_exp = torch.stack(
-                    [s[1] * torch.exp(s[0] - global_max) for s in all_stats]).sum(0)
+                    [s[1] * torch.exp(s[0] - global_max) for s in all_stats]
+                ).sum(0)
                 # label_logit is nonzero on exactly the owning rank's shard.
                 label_logit_full = torch.stack([s[2] for s in all_stats]).sum(0)
-                log_z = global_max + torch.log(sum_exp)                          # [T-1]
+                log_z = global_max + torch.log(sum_exp)  # [T-1]
                 loss_scalar = ((log_z - label_logit_full)[valid].sum() / n_valid).item()
 
-                probs = torch.exp(shift_logits - log_z[:, None])  # full-vocab softmax, local cols
+                probs = torch.exp(
+                    shift_logits - log_z[:, None]
+                )  # full-vocab softmax, local cols
                 probs[~valid] = 0.0
                 probs[owned, owned_idx] -= 1.0
                 probs /= n_valid
@@ -1108,14 +1285,16 @@ class BubbleTeaLoRATrainer:
                 # yields only a partial term, exchange-summed like item 1's
                 # o_total. (Padded to [T, H] before the exchange so the async
                 # future resolves to the final shape directly.)
-                grad_local      = torch.zeros_like(hidden_last)
+                grad_local = torch.zeros_like(hidden_last)
                 grad_local[:-1] = (probs @ lm_w).to(hidden_last.dtype)
                 if async_grad:
                     fut = self._tp_correct_exchange_sum_async(
-                        grad_local.contiguous(), "lmh_grad", rid)
+                        grad_local.contiguous(), "lmh_grad", rid
+                    )
                     return grad_local, loss_scalar, fut
                 grad_full = self._tp_correct_exchange_sum(
-                    grad_local.contiguous(), "lmh_grad", rid)
+                    grad_local.contiguous(), "lmh_grad", rid
+                )
                 return grad_full, loss_scalar
             # stats exchange failed — fall through to the local-shard path.
 
@@ -1123,35 +1302,36 @@ class BubbleTeaLoRATrainer:
             return _ret(None, 0.0)
         n_owned = owned.sum().item()
 
-        local_idx        = shift_labels.clone()
+        local_idx = shift_labels.clone()
         local_idx[~owned] = -100
         local_idx[owned] -= v_start
 
-        loss_scalar = F.cross_entropy(
-            shift_logits, local_idx, ignore_index=-100
-        ).item()
+        loss_scalar = F.cross_entropy(shift_logits, local_idx, ignore_index=-100).item()
 
-        probs = torch.softmax(shift_logits, dim=-1)   # [T-1, vocab_local]
-        probs[~owned] = 0.0   # ignored / out-of-shard tokens: zero grad (CE ignore_index)
+        probs = torch.softmax(shift_logits, dim=-1)  # [T-1, vocab_local]
+        probs[~owned] = (
+            0.0  # ignored / out-of-shard tokens: zero grad (CE ignore_index)
+        )
         probs[owned, owned_idx] -= 1.0
         probs /= n_owned
         grad_shifted = (probs @ lm_w).to(hidden_last.dtype)  # [T-1, H]
 
         # Pad the last token position with zero (no next-token target for T-1)
-        grad_hidden          = torch.zeros_like(hidden_last)
-        grad_hidden[:-1]     = grad_shifted
+        grad_hidden = torch.zeros_like(hidden_last)
+        grad_hidden[:-1] = grad_shifted
         return _ret(grad_hidden, loss_scalar)
 
     @torch.no_grad()
     def _moe_backward_passthrough(
         self,
-        x2: torch.Tensor,            # [T, H] — FFN input (output of post-attn LN)
-        grad_hidden: torch.Tensor,   # [T, H] — dL/d(MoE output)
+        x2: torch.Tensor,  # [T, H] — FFN input (output of post-attn LN)
+        grad_hidden: torch.Tensor,  # [T, H] — dL/d(MoE output)
         layer_mlp,
-        saved_gate_up: "dict | None" = None,  # {local_e: Tensor[n, 2*d_inter]} from fwd
-        e_start: "int | None" = None,         # first local expert index (chunked mode)
-        e_end:   "int | None" = None,         # exclusive upper bound  (chunked mode)
-        grad_x2_acc: "torch.Tensor | None" = None,  # accumulate into this tensor (chunked)
+        saved_gate_up: dict | None = None,  # {local_e: Tensor[n, 2*d_inter]} from fwd
+        e_start: int | None = None,  # first local expert index (chunked mode)
+        e_end: int | None = None,  # exclusive upper bound  (chunked mode)
+        grad_x2_acc: torch.Tensor
+        | None = None,  # accumulate into this tensor (chunked)
     ) -> torch.Tensor:
         """Passthrough gradient through the frozen MoE FFN.
 
@@ -1165,63 +1345,65 @@ class BubbleTeaLoRATrainer:
         For non-MoE layers (no .gate attr, e.g. mock in unit tests) the MoE
         is an identity, so the gradient passes straight through.
         """
-        if not hasattr(layer_mlp, 'gate'):
+        if not hasattr(layer_mlp, "gate"):
             return grad_hidden.clone()
 
         dtype = x2.dtype
 
         # ── Routing (frozen) — same as _training_moe_forward ──────────────
-        gate_w = layer_mlp.gate.weight.detach()             # [128, H]
-        router_logits = x2 @ gate_w.T                       # [T, 128]
+        gate_w = layer_mlp.gate.weight.detach()  # [128, H]
+        router_logits = x2 @ gate_w.T  # [T, 128]
         scores = torch.softmax(router_logits.float(), dim=-1).to(dtype)
         topk_scores, topk_ids = torch.topk(
             scores, layer_mlp.experts.top_k, dim=-1
-        )                                                    # [T, k]
+        )  # [T, k]
         topk_scores = topk_scores / (topk_scores.sum(-1, keepdim=True) + 1e-9)
 
-        w13    = layer_mlp.experts.w13_weight.detach()      # [E_local, 2*d_inter, H]
-        w2     = layer_mlp.experts.w2_weight.detach()       # [E_local, H, d_inter]
+        w13 = layer_mlp.experts.w13_weight.detach()  # [E_local, 2*d_inter, H]
+        w2 = layer_mlp.experts.w2_weight.detach()  # [E_local, H, d_inter]
         d_inter = w2.shape[2]
 
         # Chunked mode: accumulate into provided tensor; full mode: fresh zeros.
         grad_x2 = grad_x2_acc if grad_x2_acc is not None else torch.zeros_like(x2)
         _e_start = e_start if e_start is not None else 0
-        _e_end   = e_end   if e_end   is not None else self._ep_num_local_experts
+        _e_end = e_end if e_end is not None else self._ep_num_local_experts
 
         for local_e in range(_e_start, _e_end):
-            global_e   = self._ep_expert_start + local_e
-            token_mask = (topk_ids == global_e).any(-1)     # [T]
+            global_e = self._ep_expert_start + local_e
+            token_mask = (topk_ids == global_e).any(-1)  # [T]
             if not token_mask.any():
                 continue
 
-            tokens  = x2[token_mask]                        # [n, H]
+            tokens = x2[token_mask]  # [n, H]
             if saved_gate_up is not None and local_e in saved_gate_up:
-                gate_up = saved_gate_up[local_e]            # [n, 2*d_inter] — no w13 read
+                gate_up = saved_gate_up[local_e]  # [n, 2*d_inter] — no w13 read
             else:
-                gate_up = tokens @ w13[local_e].T           # [n, 2*d_inter] — fallback
-            gate    = gate_up[:, :d_inter]                  # [n, d_inter]
-            up      = gate_up[:, d_inter:]                  # [n, d_inter]
+                gate_up = tokens @ w13[local_e].T  # [n, 2*d_inter] — fallback
+            gate = gate_up[:, :d_inter]  # [n, d_inter]
+            up = gate_up[:, d_inter:]  # [n, d_inter]
 
             # Routing weight for this expert (same computation as forward)
-            exp_mask = (topk_ids[token_mask] == global_e)   # [n, k]
-            score_e  = (topk_scores[token_mask] * exp_mask.to(dtype)).sum(-1, keepdim=True)  # [n, 1]
+            exp_mask = topk_ids[token_mask] == global_e  # [n, k]
+            score_e = (topk_scores[token_mask] * exp_mask.to(dtype)).sum(
+                -1, keepdim=True
+            )  # [n, 1]
 
             # ── Backward through: output += (silu(gate)*up @ w2.T) * score_e ──
 
             # down projection: out_e = act @ w2[e].T  →  grad_act = grad_out_e @ w2[e]
             grad_out_e = grad_hidden[token_mask] * score_e  # [n, H]
-            grad_act   = grad_out_e @ w2[local_e]           # [n, d_inter]  (w2: [H, d_inter])
+            grad_act = grad_out_e @ w2[local_e]  # [n, d_inter]  (w2: [H, d_inter])
 
             # SwiGLU: act = silu(gate) * up
             #   d(act)/d(gate) = silu_deriv(gate) * up
             #   d(act)/d(up)   = silu(gate)
-            sig        = torch.sigmoid(gate)                 # [n, d_inter]
-            silu_deriv = sig * (1.0 + gate * (1.0 - sig))   # [n, d_inter]
-            grad_gate  = grad_act * silu_deriv * up          # [n, d_inter]
-            grad_up    = grad_act * F.silu(gate)             # [n, d_inter]
+            sig = torch.sigmoid(gate)  # [n, d_inter]
+            silu_deriv = sig * (1.0 + gate * (1.0 - sig))  # [n, d_inter]
+            grad_gate = grad_act * silu_deriv * up  # [n, d_inter]
+            grad_up = grad_act * F.silu(gate)  # [n, d_inter]
             grad_gate_up = torch.cat([grad_gate, grad_up], dim=-1)  # [n, 2*d_inter]
 
-            # gate+up projection: gate_up = tokens @ w13[e].T  →  grad_tokens = grad_gate_up @ w13[e]
+            # gate+up proj: grad_tokens = grad_gate_up @ w13[e]
             grad_x2[token_mask] += grad_gate_up @ w13[local_e]  # [n, H]
 
         # grad_x2 holds only this rank's local experts' contributions. The
@@ -1240,7 +1422,7 @@ class BubbleTeaLoRATrainer:
         Base model weights are detached; only LoRA deltas participate in autograd.
         Returns scalar CE loss.
         """
-        input_ids, labels = self._get_batch()    # [1, T]
+        input_ids, labels = self._get_batch()  # [1, T]
         T = input_ids.shape[1]
         dev = f"cuda:{self.device}"
 
@@ -1263,16 +1445,16 @@ class BubbleTeaLoRATrainer:
         # last_attn_out still carries grad via the LoRA deltas in _attn_lora_forward
         # (hidden is fully detached by the no_grad FFN block).
         with torch.no_grad():
-            lm_w = self._lm_head.weight.detach()    # [vocab_local, H]
-        logits_local = last_attn_out @ lm_w.T        # [T, vocab_local] — HAS grad
+            lm_w = self._lm_head.weight.detach()  # [vocab_local, H]
+        logits_local = last_attn_out @ lm_w.T  # [T, vocab_local] — HAS grad
 
         # No TP all-gather: each rank computes loss on its local logit shard.
         # This keeps the training path entirely NCCL-free.
         logits = logits_local
 
         # Shift for next-token prediction: predict token i+1 from token i
-        shift_logits = logits[:-1].contiguous()           # [T-1, vocab]
-        shift_labels = labels.squeeze(0)[1:].contiguous() # [T-1]
+        shift_logits = logits[:-1].contiguous()  # [T-1, vocab]
+        shift_labels = labels.squeeze(0)[1:].contiguous()  # [T-1]
         loss = F.cross_entropy(
             shift_logits.float(),
             shift_labels,
@@ -1310,7 +1492,9 @@ class BubbleTeaLoRATrainer:
                 x_norm, residual = layer.input_layernorm(hidden, residual)
 
         # ── Attention with LoRA ──────────────────────────────────────────
-        attn_out = self._attn_lora_forward(layer_idx, layer.self_attn, x_norm, positions)
+        attn_out = self._attn_lora_forward(
+            layer_idx, layer.self_attn, x_norm, positions
+        )
 
         # ── Post-attention LayerNorm + residual ──────────────────────────
         # x2 is the FFN input — saved for the FFN passthrough backward.
@@ -1321,7 +1505,8 @@ class BubbleTeaLoRATrainer:
         gate_up_out: dict = {}
         with torch.no_grad():
             hidden = self._training_moe_forward(
-                layer.mlp, x2, gate_up_out=gate_up_out, layer_idx=layer_idx)
+                layer.mlp, x2, gate_up_out=gate_up_out, layer_idx=layer_idx
+            )
 
         return hidden, residual, x_norm, attn_out, x2, gate_up_out
 
@@ -1329,7 +1514,7 @@ class BubbleTeaLoRATrainer:
         self,
         layer_idx: int,
         attn_layer,
-        x: torch.Tensor,    # [T, H]
+        x: torch.Tensor,  # [T, H]
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -1337,20 +1522,20 @@ class BubbleTeaLoRATrainer:
         Only lora_A and lora_B are in the autograd graph; base weights are detached.
         """
         T = x.shape[0]
-        nh  = self._n_heads_local
+        nh = self._n_heads_local
         nkv = self._n_kv_local
-        hd  = _HEAD_DIM
+        hd = _HEAD_DIM
         scaling = _LORA_ALPHA / 16  # lora_alpha / lora_rank = 1.0
 
         # ── Retrieve base QKV weights (detached) ─────────────────────────
         # qkv_proj.weight layout (per rank): [q_local + k_local + v_local, H]
-        q_sz = nh  * hd
+        q_sz = nh * hd
         kv_sz = nkv * hd
         with torch.no_grad():
             qkv_w = attn_layer.qkv_proj.weight.detach()  # [q+k+v, H] per rank
-            q_base = F.linear(x.detach(), qkv_w[:q_sz])            # [T, q_sz]
-            k_base = F.linear(x.detach(), qkv_w[q_sz:q_sz+kv_sz]) # [T, kv_sz]
-            v_base = F.linear(x.detach(), qkv_w[q_sz+kv_sz:])     # [T, kv_sz]
+            q_base = F.linear(x.detach(), qkv_w[:q_sz])  # [T, q_sz]
+            k_base = F.linear(x.detach(), qkv_w[q_sz : q_sz + kv_sz])  # [T, kv_sz]
+            v_base = F.linear(x.detach(), qkv_w[q_sz + kv_sz :])  # [T, kv_sz]
             # _sync_to_vllm merges the LoRA delta into qkv_proj.weight after each
             # optimizer step.  Subtract the previously-merged delta so the training
             # forward uses the pure base-model output (the explicit q_delta/v_delta
@@ -1358,30 +1543,55 @@ class BubbleTeaLoRATrainer:
             xf = x.detach().float()
             prev_q = getattr(self, f"_prev_delta_{layer_idx}_q_proj", None)
             if prev_q is not None:
-                q_base = (q_base.float() - F.linear(xf, prev_q.float())).to(q_base.dtype)
+                q_base = (q_base.float() - F.linear(xf, prev_q.float())).to(
+                    q_base.dtype
+                )
+            prev_k = getattr(self, f"_prev_delta_{layer_idx}_k_proj", None)
+            if prev_k is not None:
+                k_base = (k_base.float() - F.linear(xf, prev_k.float())).to(
+                    k_base.dtype
+                )
             prev_v = getattr(self, f"_prev_delta_{layer_idx}_v_proj", None)
             if prev_v is not None:
-                v_base = (v_base.float() - F.linear(xf, prev_v.float())).to(v_base.dtype)
+                v_base = (v_base.float() - F.linear(xf, prev_v.float())).to(
+                    v_base.dtype
+                )
 
-        # ── LoRA deltas for Q and V ───────────────────────────────────────
+        # ── LoRA deltas for Q, K, and V ──────────────────────────────────
         lora_d = self._lora.get(layer_idx, {})
         A_q = lora_d.get("q_proj.lora_A")
         B_q = lora_d.get("q_proj.lora_B")
+        A_k = lora_d.get("k_proj.lora_A")
+        B_k = lora_d.get("k_proj.lora_B")
         A_v = lora_d.get("v_proj.lora_A")
         B_v = lora_d.get("v_proj.lora_B")
 
         # x participates in autograd only through the LoRA path
-        q_delta = (x @ A_q.T.to(x.dtype)) @ B_q.T.to(x.dtype) * scaling if (A_q is not None and B_q is not None) else 0
-        v_delta = (x @ A_v.T.to(x.dtype)) @ B_v.T.to(x.dtype) * scaling if (A_v is not None and B_v is not None) else 0
+        q_delta = (
+            (x @ A_q.T.to(x.dtype)) @ B_q.T.to(x.dtype) * scaling
+            if (A_q is not None and B_q is not None)
+            else 0
+        )
+        k_delta = (
+            (x @ A_k.T.to(x.dtype)) @ B_k.T.to(x.dtype) * scaling
+            if (A_k is not None and B_k is not None)
+            else 0
+        )
+        v_delta = (
+            (x @ A_v.T.to(x.dtype)) @ B_v.T.to(x.dtype) * scaling
+            if (A_v is not None and B_v is not None)
+            else 0
+        )
 
         q = q_base.detach() + q_delta  # [T, q_sz]  — grad flows through delta
+        k = k_base.detach() + k_delta  # [T, kv_sz] — grad flows through delta
         v = v_base.detach() + v_delta  # [T, kv_sz]
-        k = k_base.detach()            # [T, kv_sz]  — no LoRA on K
 
-        # ── QK norm (per head) ────────────────────────────────────────────
-        with torch.no_grad():
-            q = attn_layer.q_norm(q.view(T, nh, hd)).view(T, q_sz)
-            k = attn_layer.k_norm(k.view(T, nkv, hd)).view(T, kv_sz)
+        # ── QK norm (per head) — present in Qwen3, absent in Qwen1.5-MoE ──
+        if hasattr(attn_layer, "q_norm"):
+            with torch.no_grad():
+                q = attn_layer.q_norm(q.view(T, nh, hd)).view(T, q_sz)
+                k = attn_layer.k_norm(k.view(T, nkv, hd)).view(T, kv_sz)
 
         # ── Rotary embeddings ─────────────────────────────────────────────
         with torch.no_grad():
@@ -1394,9 +1604,9 @@ class BubbleTeaLoRATrainer:
         # attention scores can reach ~11 → exp(11) ≈ 80k > bfloat16 max (65504)
         # → Inf → NaN in softmax → NaN residual propagating through all 48 layers.
         # Flash attention computes softmax in float32 internally, avoiding overflow.
-        q3 = q_rot.view(T, nh,  hd).transpose(0, 1).unsqueeze(0)   # [1, nh,  T, hd]
-        k3 = k_rot.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)   # [1, nkv, T, hd]
-        v3 = v.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)        # [1, nkv, T, hd]
+        q3 = q_rot.view(T, nh, hd).transpose(0, 1).unsqueeze(0)  # [1, nh,  T, hd]
+        k3 = k_rot.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)  # [1, nkv, T, hd]
+        v3 = v.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)  # [1, nkv, T, hd]
 
         # GQA: replicate K and V to match Q head count
         if nkv < nh:
@@ -1404,9 +1614,9 @@ class BubbleTeaLoRATrainer:
             k3 = k3.repeat_interleave(rep, dim=1)
             v3 = v3.repeat_interleave(rep, dim=1)
 
-        attn_out = F.scaled_dot_product_attention(
-            q3, k3, v3, is_causal=True
-        ).squeeze(0)   # [nh, T, hd]
+        attn_out = F.scaled_dot_product_attention(q3, k3, v3, is_causal=True).squeeze(
+            0
+        )  # [nh, T, hd]
         attn_out = attn_out.transpose(0, 1).reshape(T, nh * hd)  # [T, q_sz]
 
         # ── O projection with LoRA delta ──────────────────────────────────
@@ -1415,12 +1625,18 @@ class BubbleTeaLoRATrainer:
             o_base = F.linear(attn_out.detach(), o_w)  # [T, H]
             prev_o = getattr(self, f"_prev_delta_{layer_idx}_o_proj", None)
             if prev_o is not None:
-                o_base = (o_base.float() - F.linear(attn_out.float(), prev_o.float())).to(o_base.dtype)
+                o_base = (
+                    o_base.float() - F.linear(attn_out.float(), prev_o.float())
+                ).to(o_base.dtype)
 
         A_o = lora_d.get("o_proj.lora_A")
         B_o = lora_d.get("o_proj.lora_B")
         # For row-parallel O: lora_A is sharded along input dim
-        o_delta = (attn_out @ A_o.T.to(attn_out.dtype)) @ B_o.T.to(attn_out.dtype) * scaling if (A_o is not None and B_o is not None) else 0
+        o_delta = (
+            (attn_out @ A_o.T.to(attn_out.dtype)) @ B_o.T.to(attn_out.dtype) * scaling
+            if (A_o is not None and B_o is not None)
+            else 0
+        )
 
         # Row-parallel O: in a standard synchronous training loop, each rank would
         # all-reduce here. In BubbleTea, the training forward fires asynchronously
@@ -1428,7 +1644,7 @@ class BubbleTeaLoRATrainer:
         # inference NCCL on the main thread (dual-group contention → deadlock).
         # By default the output is therefore a partial rank-local contribution;
         # the loss gradient will be partial but the server stays live.
-        o_total = o_base.detach() + o_delta   # [T, H] — partial row-parallel sum
+        o_total = o_base.detach() + o_delta  # [T, H] — partial row-parallel sum
         if self._tp_correct:
             if torch.is_grad_enabled():
                 # Autograd path (_forward_loss / training_step): the identity
@@ -1444,7 +1660,8 @@ class BubbleTeaLoRATrainer:
                 # sub-op firing cannot poison sync_replicated_params's
                 # collectives.
                 o_total = self._tp_correct_exchange_sum(
-                    o_total.contiguous(), f"o_{layer_idx}", self._fwd_round)
+                    o_total.contiguous(), f"o_{layer_idx}", self._fwd_round
+                )
         return o_total
 
     # ── Pure-PyTorch MoE forward (training path) ─────────────────────────
@@ -1453,8 +1670,8 @@ class BubbleTeaLoRATrainer:
         self,
         layer_mlp,
         hidden: torch.Tensor,
-        gate_up_out: "dict | None" = None,
-        layer_idx: "int | None" = None,
+        gate_up_out: dict | None = None,
+        layer_idx: int | None = None,
     ) -> torch.Tensor:
         """Local-expert MoE forward (training path, non-C+D_batch).
 
@@ -1474,50 +1691,73 @@ class BubbleTeaLoRATrainer:
         Falls back to a direct call for non-MoE layers (e.g. mock/dense layers
         in unit tests that don't have a .gate attribute).
         """
-        if not hasattr(layer_mlp, 'gate'):
+        if not hasattr(layer_mlp, "gate"):
             return layer_mlp(hidden) if callable(layer_mlp) else hidden
 
         T, H = hidden.shape
         dev, dtype = hidden.device, hidden.dtype
 
         # Gate weight is replicated on all ranks — same routing on every GPU
-        gate_w = layer_mlp.gate.weight.detach()           # [128, H]
-        router_logits = hidden.detach() @ gate_w.T        # [T, 128]
+        gate_w = layer_mlp.gate.weight.detach()  # [128, H]
+        router_logits = hidden.detach() @ gate_w.T  # [T, 128]
         scores = torch.softmax(router_logits.float(), dim=-1).to(dtype)
         topk_scores, topk_ids = torch.topk(
             scores, layer_mlp.experts.top_k, dim=-1
-        )                                                   # [T, k]
+        )  # [T, k]
         # norm_topk_prob=True: renormalise selected scores
         topk_scores = topk_scores / (topk_scores.sum(-1, keepdim=True) + 1e-9)
 
-        w13 = layer_mlp.experts.w13_weight.detach()       # [E_local, 2*768, H]
-        w2  = layer_mlp.experts.w2_weight.detach()        # [E_local, H, 768]
+        w13 = layer_mlp.experts.w13_weight.detach()  # [E_local, 2*768, H]
+        w2 = layer_mlp.experts.w2_weight.detach()  # [E_local, H, 768]
         d_inter = w2.shape[2]
         output = torch.zeros(T, H, device=dev, dtype=dtype)
 
         for local_e in range(self._ep_num_local_experts):
-            global_e   = self._ep_expert_start + local_e
-            token_mask = (topk_ids == global_e).any(-1)   # [T] bool
+            global_e = self._ep_expert_start + local_e
+            token_mask = (topk_ids == global_e).any(-1)  # [T] bool
             if not token_mask.any():
                 continue
-            tokens   = hidden[token_mask]                  # [n, H]
-            gate_up  = tokens @ w13[local_e].T             # [n, 2*768]
+            tokens = hidden[token_mask]  # [n, H]
+            gate_up = tokens @ w13[local_e].T  # [n, 2*768]
             if gate_up_out is not None:
-                gate_up_out[local_e] = gate_up.detach()   # save for passthrough backward
-            act      = F.silu(gate_up[:, :d_inter]) * gate_up[:, d_inter:]
-            out_e    = act @ w2[local_e].T                 # [n, H]
+                gate_up_out[local_e] = gate_up.detach()  # save for passthrough backward
+            act = F.silu(gate_up[:, :d_inter]) * gate_up[:, d_inter:]
+            out_e = act @ w2[local_e].T  # [n, H]
             # Routing weight for this expert per token
-            exp_mask = (topk_ids[token_mask] == global_e) # [n, k]
-            score_e  = (topk_scores[token_mask] * exp_mask.to(dtype)).sum(-1, keepdim=True)
+            exp_mask = topk_ids[token_mask] == global_e  # [n, k]
+            score_e = (topk_scores[token_mask] * exp_mask.to(dtype)).sum(
+                -1, keepdim=True
+            )
             output[token_mask] += out_e * score_e
 
-        # `output` holds only this rank's local experts' contributions.
+        # Shared expert path (Qwen1.5-MoE / Qwen2-MoE): all tokens pass through
+        # a replicated MLP gated by a learned per-token scalar.  Access weights
+        # directly to avoid NCCL from the bwd_stream worker thread.
+        se = getattr(layer_mlp, "shared_expert", None)
+        if se is not None:
+            gu_w = (
+                se.gate_up_proj.weight.detach()
+            )  # [2*d_local, H] column-parallel shard
+            d_w = se.down_proj.weight.detach()  # [H_out, d_local] row-parallel shard
+            gate_up = hidden @ gu_w.T  # [T, 2*d_local]
+            d_local = gate_up.shape[-1] // 2
+            act = F.silu(gate_up[:, :d_local]) * gate_up[:, d_local:]  # SiluAndMul
+            se_out = F.linear(act, d_w)  # [T, H_out] — partial; summed below
+            if getattr(se, "expert_gate", None) is not None:
+                sg_w = se.expert_gate.weight.detach()  # [1, H]
+                se_gate = torch.sigmoid(hidden @ sg_w.T)  # [T, 1]
+                se_out = se_gate * se_out
+            output = output + se_out
+            if gate_up_out is not None:
+                gate_up_out["shared"] = gate_up.detach()
+
+        # `output` holds only this rank's local experts' + shared expert's partial.
         # Exchange-sum across ranks to reconstruct the full MoE output (same
         # per-round timeout/fallback semantics as item 1's o_total).
-        if (self._tp_correct and self._ep_size > 1
-                and layer_idx is not None):
+        if self._tp_correct and self._ep_size > 1 and layer_idx is not None:
             output = self._tp_correct_exchange_sum(
-                output.contiguous(), f"moefwd_{layer_idx}", self._fwd_round)
+                output.contiguous(), f"moefwd_{layer_idx}", self._fwd_round
+            )
 
         return output
 
@@ -1536,16 +1776,16 @@ class BubbleTeaLoRATrainer:
             scaling = _LORA_ALPHA / 16
             for layer_idx, proj_dict in self._lora.items():
                 layer = self._layers[layer_idx]
-                attn  = layer.self_attn
+                attn = layer.self_attn
 
                 # qkv_proj.weight layout per rank: [q_local + k_local + v_local, H]
-                q_sz  = self._n_heads_local  * _HEAD_DIM
-                kv_sz = self._n_kv_local     * _HEAD_DIM
+                q_sz = self._n_heads_local * _HEAD_DIM
+                kv_sz = self._n_kv_local * _HEAD_DIM
 
                 for proj_ab, param in proj_dict.items():
-                    proj, ab = proj_ab.rsplit(".", 1)   # e.g. "q_proj", "lora_A"
+                    proj, ab = proj_ab.rsplit(".", 1)  # e.g. "q_proj", "lora_A"
                     if ab == "lora_A":
-                        continue     # process once per projection when we see lora_B
+                        continue  # process once per projection when we see lora_B
 
                     A_key = proj + ".lora_A"
                     B_key = proj + ".lora_B"
@@ -1553,7 +1793,7 @@ class BubbleTeaLoRATrainer:
                         continue
                     A = proj_dict[A_key].data.to(torch.bfloat16)  # [r, in_dim]
                     B = proj_dict[B_key].data.to(torch.bfloat16)  # [out_local, r]
-                    delta = (B @ A) * scaling                       # [out_local, in_dim]
+                    delta = (B @ A) * scaling  # [out_local, in_dim]
 
                     prev_key = f"_prev_delta_{layer_idx}_{proj}"
                     prev = getattr(self, prev_key, None)
@@ -1565,12 +1805,12 @@ class BubbleTeaLoRATrainer:
                                 w -= prev
                             w += delta
                         elif proj == "k_proj":
-                            w = attn.qkv_proj.weight[q_sz:q_sz + kv_sz]
+                            w = attn.qkv_proj.weight[q_sz : q_sz + kv_sz]
                             if prev is not None:
                                 w -= prev
                             w += delta
                         elif proj == "v_proj":
-                            w = attn.qkv_proj.weight[q_sz + kv_sz:]
+                            w = attn.qkv_proj.weight[q_sz + kv_sz :]
                             if prev is not None:
                                 w -= prev
                             w += delta
@@ -1613,10 +1853,20 @@ class BubbleTeaLoRATrainer:
                 threading.Thread(
                     target=trainer._build_data_iter_bg,
                     args=(trainer._tokenizer_path, trainer._cache_dir),
-                    daemon=True, name="bt-lora-data-init",
+                    daemon=True,
+                    name="bt-lora-data-init",
                 ).start()
 
             if not trainer._data_ready.is_set():
+                if not getattr(trainer, "_fwd_data_wait_warned", False):
+                    trainer._fwd_data_wait_warned = True
+                    import warnings as _w
+
+                    _w.warn(
+                        f"[BubbleTea LoRA] fwd_init: waiting for training data "
+                        f"(device={trainer.device})",
+                        stacklevel=1,
+                    )
                 trainer._fwd_layer_state = None
                 return
 
@@ -1626,12 +1876,30 @@ class BubbleTeaLoRATrainer:
 
             # Prevent concurrent forwards (lock stays held until last layer).
             if not trainer._fwd_running.acquire(blocking=False):
+                log.debug(
+                    "[BubbleTea] fwd_init: lock busy (rank=%d round=%d)",
+                    trainer._tp_rank,
+                    trainer._fwd_round,
+                )
                 trainer._fwd_layer_state = None
                 return
 
             # New forward round starting -- see _fwd_round's definition in
             # __init__ (round id for _tp_correct_exchange_sum).
             trainer._fwd_round += 1
+            log.debug(
+                "[BubbleTea] fwd_init: starting round %d (rank=%d)",
+                trainer._fwd_round,
+                trainer._tp_rank,
+            )
+
+            # Rendezvous: agree on a shared round number across TP ranks so
+            # the TCPStore exchange keys match. Without this, the faster rank
+            # (lighter expert traffic) pulls ahead and every exchange times out.
+            if not trainer._sync_fwd_round():
+                trainer._fwd_running.release()
+                trainer._fwd_layer_state = None
+                return
 
             # ── Initialise per-layer state ─────────────────────────────────
             try:
@@ -1645,10 +1913,10 @@ class BubbleTeaLoRATrainer:
                     # same sequences without cross-rank communication.
                     ids, labels = trainer._get_batch()
 
-                    T         = ids.shape[1]
+                    T = ids.shape[1]
                     positions = torch.arange(T, device=dev, dtype=torch.long)
-                    tids = ids.squeeze(0)                       # [T]
-                    if hasattr(trainer._embed, 'weight'):
+                    tids = ids.squeeze(0)  # [T]
+                    if hasattr(trainer._embed, "weight"):
                         # Bypass VocabParallelEmbedding.forward(), which calls
                         # tensor_model_parallel_all_reduce on the inference TP
                         # communicator — this races with inference TP all-reduces
@@ -1656,12 +1924,12 @@ class BubbleTeaLoRATrainer:
                         # Instead compute local partial embeddings and correct
                         # them via the TCPStore-based exchange (see
                         # _tp_correct_exchange_sum), gated by VLLM_FT_TP_CORRECT.
-                        embed_w   = trainer._embed.weight.detach()  # [vocab_local, H]
-                        v_local   = embed_w.shape[0]
-                        v_start   = trainer._tp_rank * v_local
-                        valid     = (tids >= v_start) & (tids < v_start + v_local)
+                        embed_w = trainer._embed.weight.detach()  # [vocab_local, H]
+                        v_local = embed_w.shape[0]
+                        v_start = trainer._tp_rank * v_local
+                        valid = (tids >= v_start) & (tids < v_start + v_local)
                         local_ids = (tids - v_start).clamp(0, v_local - 1)
-                        hidden    = embed_w[local_ids]              # [T, H]
+                        hidden = embed_w[local_ids]  # [T, H]
                         hidden[~valid] = 0
                         # Partial embedding: tokens outside this rank's vocab shard
                         # are zeroed. Each token is nonzero on exactly one rank's
@@ -1672,20 +1940,21 @@ class BubbleTeaLoRATrainer:
                         # sub-op resolves the future.
                         if trainer._tp_correct:
                             hidden_fut = trainer._tp_correct_exchange_sum_async(
-                                hidden.contiguous(), "embed", trainer._fwd_round)
+                                hidden.contiguous(), "embed", trainer._fwd_round
+                            )
                         else:
                             hidden_fut = None
                     else:
-                        hidden = trainer._embed(tids)              # mock / single-GPU
+                        hidden = trainer._embed(tids)  # mock / single-GPU
                         hidden_fut = None
 
                 trainer._fwd_layer_state = {
-                    "hidden":     hidden,
+                    "hidden": hidden,
                     "hidden_fut": hidden_fut,
-                    "residual":   None,
-                    "positions":  positions,
-                    "labels":     labels,
-                    "ok":         True,
+                    "residual": None,
+                    "positions": positions,
+                    "labels": labels,
+                    "ok": True,
                 }
             except Exception as exc:
                 log.debug("[BubbleTea LoRA] fwd_init error: %s", exc)
@@ -1693,7 +1962,7 @@ class BubbleTeaLoRATrainer:
                 trainer._fwd_running.release()
 
         def _make_layer_op(i: int):
-            is_last = (i == N - 1)
+            is_last = i == N - 1
 
             def _fwd_layer():
                 state = trainer._fwd_layer_state
@@ -1707,20 +1976,39 @@ class BubbleTeaLoRATrainer:
                     # _fwd_init (its collect ran during the inter-op gap).
                     if i == 0 and state.get("hidden_fut") is not None:
                         state["hidden"] = state.pop("hidden_fut").result()
+                    # If the embed exchange timed out and fell back, rank 1
+                    # ends up with all-zero hidden (its vocab shard has no
+                    # tokens for this batch).  Propagating zeros through 48
+                    # layers produces loss ≈ ln(V) with near-zero gradient —
+                    # skip to avoid poisoning the accumulator.
+                    if i == 0 and state["hidden"].abs().max().item() == 0.0:
+                        log.warning(
+                            "[BubbleTea] all-zero embedding (embed-exchange fallback "
+                            "or empty vocab shard) — skipping round"
+                        )
+                        state["ok"] = False
+                        return
 
-                    # res_a = pre-norm sum for input LayerNorm (hidden + prev_residual).
-                    # Captured before _layer_forward so it reflects the exact input state.
-                    # Needed by the passthrough backward to run LN backward via mini autograd.
+                    # res_a = pre-norm sum for input LN (hidden + prev_residual).
+                    # Captured before _layer_forward; needed by passthrough bwd.
                     _res = state["residual"]
-                    res_a = (state["hidden"] + _res).detach() if _res is not None \
-                            else state["hidden"].detach()
+                    res_a = (
+                        (state["hidden"] + _res).detach()
+                        if _res is not None
+                        else state["hidden"].detach()
+                    )
 
                     with torch.no_grad():
-                        hidden, residual, x_norm, attn_out, x2, gate_up = trainer._layer_forward(
-                            i, trainer._layers[i],
-                            state["hidden"], state["residual"], state["positions"],
+                        hidden, residual, x_norm, attn_out, x2, gate_up = (
+                            trainer._layer_forward(
+                                i,
+                                trainer._layers[i],
+                                state["hidden"],
+                                state["residual"],
+                                state["positions"],
+                            )
                         )
-                    state["hidden"]   = hidden
+                    state["hidden"] = hidden
                     state["residual"] = residual
 
                     if _NAN_DEBUG:
@@ -1728,71 +2016,95 @@ class BubbleTeaLoRATrainer:
                             h_rows = torch.isnan(hidden).any(-1)
                             r_rows = torch.isnan(residual).any(-1)
                             a_rows = torch.isnan(attn_out).any(-1)
-                            hn, rn, an = (int(h_rows.sum()), int(r_rows.sum()),
-                                          int(a_rows.sum()))
-                            rm = residual.float().nan_to_num(0.).abs().max().item()
-                            hm = hidden.float().nan_to_num(0.).abs().max().item()
-                            am = attn_out.float().nan_to_num(0.).abs().max().item()
+                            hn, rn, an = (
+                                int(h_rows.sum()),
+                                int(r_rows.sum()),
+                                int(a_rows.sum()),
+                            )
+                            rm = residual.float().nan_to_num(0.0).abs().max().item()
+                            hm = hidden.float().nan_to_num(0.0).abs().max().item()
+                            am = attn_out.float().nan_to_num(0.0).abs().max().item()
                             prev_clean = state.get("_nan_clean", True)
                             now_nan = bool(hn or rn or an)
                             # Log the first layer where NaN appears, any layer
                             # with extreme magnitudes, and the last layer.
-                            if ((now_nan and prev_clean) or rm > 1e6 or hm > 1e6
-                                    or is_last):
+                            if (
+                                (now_nan and prev_clean)
+                                or rm > 1e6
+                                or hm > 1e6
+                                or is_last
+                            ):
                                 log.warning(
                                     "[BT-NANDBG] round=%d layer=%d "
                                     "nan_rows(hid=%d res=%d attn=%d)/%d "
                                     "absmax(hid=%.3e res=%.3e attn=%.3e)",
-                                    trainer._fwd_round, i, hn, rn, an,
-                                    hidden.shape[0], hm, rm, am)
+                                    trainer._fwd_round,
+                                    i,
+                                    hn,
+                                    rn,
+                                    an,
+                                    hidden.shape[0],
+                                    hm,
+                                    rm,
+                                    am,
+                                )
                             state["_nan_clean"] = prev_clean and not now_nan
 
                     # Save activations needed by the backward sub-ops.
                     if "layers" not in trainer._fwd:
                         trainer._fwd["layers"] = {}
                     trainer._fwd["layers"][i] = {
-                        "x_norm":   x_norm,    # [T, H]   input to QKV
-                        "attn_out": attn_out,  # [T, H]   O proj output (post-attn LN input)
-                        "x2":       x2,        # [T, H]   input to FFN
-                        "res_a":    res_a,     # [T, H]   pre-norm sum for input LN
-                        "gate_up":  gate_up,   # {local_e: Tensor[n,2d]} expert gate_up activations
+                        "x_norm": x_norm,  # [T, H]   input to QKV
+                        "attn_out": attn_out,  # [T, H]  O proj output
+                        "x2": x2,  # [T, H]   input to FFN
+                        "res_a": res_a,  # [T, H]  pre-norm sum for input LN
+                        "gate_up": gate_up,  # {e: Tensor[n,2d]} SwiGLU inputs
                     }
 
                     if is_last:
                         import time as _t
+
                         # True final hidden = FFN output + accumulated residual.
                         # 'hidden' is just the last MoE delta; 'residual' carries
                         # the accumulated skip connection through all 48 layers.
-                        # Without adding residual, logits are near-zero → CE ≈ log(vocab).
+                        # Without residual, logits are near-zero → CE ≈ log(vocab).
                         final = (hidden + residual).detach()
                         h_nan = torch.isnan(hidden).any().item()
                         r_nan = torch.isnan(residual).any().item()
                         if h_nan or r_nan:
-                            log.warning("[BubbleTea] NaN in last fwd: hidden=%s residual=%s; "
-                                        "falling back to hidden-only hidden_last",
-                                        h_nan, r_nan)
-                            final = hidden.detach()
-                        # If hidden_last contains NaN/Inf or extreme values that would
+                            log.warning(
+                                "[BubbleTea] NaN in last fwd: hidden=%s residual=%s "
+                                "— skipping round",
+                                h_nan,
+                                r_nan,
+                            )
+                            trainer._fwd_layer_state = None
+                            trainer._fwd_running.release()
+                            return
+                        # If hidden_last contains Inf or extreme values that would
                         # cause float32 overflow (|x|^2 > float32_max) inside _rms_norm,
-                        # skip this cycle to avoid propagating NaN gradients.
-                        _bad = (torch.isnan(final).any().item() or
-                                torch.isinf(final).any().item() or
-                                final.float().abs().max().item() > 1e18)
+                        # skip this cycle to avoid propagating bad gradients.
+                        _bad = (
+                            torch.isinf(final).any().item()
+                            or final.float().abs().max().item() > 1e18
+                        )
                         if _bad:
-                            log.warning("[BubbleTea] hidden_last has NaN/Inf/extreme values "
-                                        "(max=%.2e) — skipping this training sample",
-                                        final.float().abs().max().item())
+                            log.warning(
+                                "[BubbleTea] hidden_last has Inf/extreme values "
+                                "(max=%.2e) — skipping this training sample",
+                                final.float().abs().max().item(),
+                            )
                             trainer._fwd_layer_state = None
                             trainer._fwd_running.release()
                             return
                         trainer._fwd["hidden_last"] = final
-                        trainer._fwd["labels"]      = state["labels"]
+                        trainer._fwd["labels"] = state["labels"]
                         # Round id of the forward that produced hidden_last —
                         # _lm_head_op's vocab-parallel-CE exchange must use this,
                         # not whatever _fwd_round is by the time backward runs.
-                        trainer._fwd["round"]       = trainer._fwd_round
-                        trainer._fwd_last_done      = _t.time()
-                        trainer._fwd_layer_state    = None
+                        trainer._fwd["round"] = trainer._fwd_round
+                        trainer._fwd_last_done = _t.time()
+                        trainer._fwd_layer_state = None
                         trainer._fwd_running.release()
                 except Exception as exc:
                     log.debug("[BubbleTea LoRA] fwd_layer_%d error: %s", i, exc)
@@ -1839,15 +2151,19 @@ class BubbleTeaLoRATrainer:
             # Run the standard init first (populates _fwd_layer_state).
             # We call _fwd_init by re-using build_fwd_subops' init logic inline.
             import time as _t
+
             from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
-                ft_moe_set_hidden, ft_moe_reset_moe_delta,
+                ft_moe_reset_moe_delta,
+                ft_moe_set_hidden,
             )
+
             if not trainer._data_thread_started:
                 trainer._data_thread_started = True
                 threading.Thread(
                     target=trainer._build_data_iter_bg,
                     args=(trainer._tokenizer_path, trainer._cache_dir),
-                    daemon=True, name="bt-lora-data-init",
+                    daemon=True,
+                    name="bt-lora-data-init",
                 ).start()
             if not trainer._data_ready.is_set():
                 trainer._fwd_layer_state = None
@@ -1865,6 +2181,12 @@ class BubbleTeaLoRATrainer:
             # on a stale round_id in this (cdbatch) forward path.
             trainer._fwd_round += 1
 
+            # Rendezvous: agree on a shared round number across TP ranks.
+            if not trainer._sync_fwd_round():
+                trainer._fwd_running.release()
+                trainer._fwd_layer_state = None
+                return
+
             # Clear any stale per-layer MoE delta left over from the previous
             # round (see ft_moe_reset_moe_delta's docstring) before layer 0's
             # _fwd_attn_only seeds a new one.
@@ -1874,25 +2196,29 @@ class BubbleTeaLoRATrainer:
                 with torch.no_grad():
                     dev = f"cuda:{trainer.device}"
                     ids, labels = trainer._get_batch()
-                    T         = ids.shape[1]
+                    T = ids.shape[1]
                     positions = torch.arange(T, device=dev, dtype=torch.long)
                     tids = ids.squeeze(0)
-                    if hasattr(trainer._embed, 'weight'):
-                        embed_w   = trainer._embed.weight.detach()
-                        v_local   = embed_w.shape[0]
-                        v_start   = trainer._tp_rank * v_local
-                        valid     = (tids >= v_start) & (tids < v_start + v_local)
+                    if hasattr(trainer._embed, "weight"):
+                        embed_w = trainer._embed.weight.detach()
+                        v_local = embed_w.shape[0]
+                        v_start = trainer._tp_rank * v_local
+                        valid = (tids >= v_start) & (tids < v_start + v_local)
                         local_ids = (tids - v_start).clamp(0, v_local - 1)
-                        hidden    = embed_w[local_ids]
+                        hidden = embed_w[local_ids]
                         hidden[~valid] = 0
                         if trainer._tp_correct:
                             hidden = trainer._tp_correct_exchange_sum(
-                                hidden.contiguous(), "embed", trainer._fwd_round)
+                                hidden.contiguous(), "embed", trainer._fwd_round
+                            )
                     else:
                         hidden = trainer._embed(tids)
                 trainer._fwd_layer_state = {
-                    "hidden": hidden, "residual": None,
-                    "positions": positions, "labels": labels, "ok": True,
+                    "hidden": hidden,
+                    "residual": None,
+                    "positions": positions,
+                    "labels": labels,
+                    "ok": True,
                 }
                 # Seed the inline MoE with the real embedding output.
                 evt = torch.cuda.Event()
@@ -1906,9 +2232,12 @@ class BubbleTeaLoRATrainer:
         def _make_attn_only_op(i: int):
             def _fwd_attn_only():
                 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
-                    ft_moe_set_hidden, ft_moe_get_moe_delta,
-                    ft_moe_get_moe_delta_layer, ft_moe_get_moe_delta_event,
+                    ft_moe_get_moe_delta,
+                    ft_moe_get_moe_delta_event,
+                    ft_moe_get_moe_delta_layer,
+                    ft_moe_set_hidden,
                 )
+
                 state = trainer._fwd_layer_state
                 if state is None or not state["ok"]:
                     return
@@ -1931,8 +2260,11 @@ class BubbleTeaLoRATrainer:
                             state["hidden"] = state["hidden"] + delta
 
                     _res = state["residual"]
-                    res_a = (state["hidden"] + _res).detach() if _res is not None \
-                            else state["hidden"].detach()
+                    res_a = (
+                        (state["hidden"] + _res).detach()
+                        if _res is not None
+                        else state["hidden"].detach()
+                    )
                     with torch.no_grad():
                         layer = trainer._layers[i]
                         # ── Input LayerNorm ────────────────────────────────────
@@ -1956,28 +2288,30 @@ class BubbleTeaLoRATrainer:
                     # bwd_stream so the main stream can wait before using x2 as
                     # the inline MoE hidden state.
                     evt = torch.cuda.Event()
-                    evt.record()   # records on bwd_stream (we are in its worker)
+                    evt.record()  # records on bwd_stream (we are in its worker)
                     ft_moe_set_hidden(x2, evt)
 
                     # Advance _fwd_layer_state for the next layer's attention.
                     # hidden is set to x2 (the MoE input) — the MoE delta will
                     # be provided by the inline pass; _passthrough in backward
                     # re-derives it anyway when computing grad_hidden.
-                    state["hidden"]   = x2
+                    state["hidden"] = x2
                     state["residual"] = residual
 
                     # Save activations needed by backward sub-ops.
                     if "layers" not in trainer._fwd:
                         trainer._fwd["layers"] = {}
                     trainer._fwd["layers"][i] = {
-                        "x_norm":   x_norm,
+                        "x_norm": x_norm,
                         "attn_out": attn_out,
-                        "x2":       x2,
-                        "res_a":    res_a,
+                        "x2": x2,
+                        "res_a": res_a,
                     }
 
                 except Exception as exc:
-                    log.debug("[BubbleTea C+D_batch] fwd_attn_only_%d error: %s", i, exc)
+                    log.debug(
+                        "[BubbleTea C+D_batch] fwd_attn_only_%d error: %s", i, exc
+                    )
                     state["ok"] = False
 
             _fwd_attn_only.__name__ = "_fwd_layer"  # same name for timing log
@@ -1991,11 +2325,14 @@ class BubbleTeaLoRATrainer:
             called ft_moe_set_hidden) -- otherwise falls back to the
             previous approximation (MoE delta omitted).
             """
-            from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
-                ft_moe_get_moe_delta, ft_moe_get_moe_delta_layer,
-                ft_moe_get_moe_delta_event,
-            )
             import time as _t
+
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+                ft_moe_get_moe_delta,
+                ft_moe_get_moe_delta_event,
+                ft_moe_get_moe_delta_layer,
+            )
+
             state = trainer._fwd_layer_state
             if state is None:
                 return
@@ -2014,20 +2351,22 @@ class BubbleTeaLoRATrainer:
                             torch.cuda.current_stream().wait_event(evt)
                         x2_last = x2_last + delta
                 final = (x2_last + residual_last).detach()
-                _bad = (torch.isnan(final).any().item() or
-                        torch.isinf(final).any().item() or
-                        final.float().abs().max().item() > 1e18)
+                _bad = (
+                    torch.isnan(final).any().item()
+                    or torch.isinf(final).any().item()
+                    or final.float().abs().max().item() > 1e18
+                )
                 if _bad:
                     log.warning("[BubbleTea C+D_batch] hidden_last bad — skipping")
                     trainer._fwd_layer_state = None
                     trainer._fwd_running.release()
                     return
                 trainer._fwd["hidden_last"] = final
-                trainer._fwd["labels"]      = state["labels"]
+                trainer._fwd["labels"] = state["labels"]
                 # Same round stamp as build_fwd_subops' last-layer op (see there).
-                trainer._fwd["round"]       = trainer._fwd_round
-                trainer._fwd_last_done      = _t.time()
-                trainer._fwd_layer_state    = None
+                trainer._fwd["round"] = trainer._fwd_round
+                trainer._fwd_last_done = _t.time()
+                trainer._fwd_layer_state = None
                 trainer._fwd_running.release()
             except Exception as exc:
                 log.debug("[BubbleTea C+D_batch] fwd_finalize error: %s", exc)
@@ -2036,8 +2375,11 @@ class BubbleTeaLoRATrainer:
 
         _fwd_finalize.__name__ = "_fwd_layer"  # same name for timing log
 
-        return ([_fwd_init_cdbatch] + [_make_attn_only_op(i) for i in range(N)]
-                + [_fwd_finalize])
+        return (
+            [_fwd_init_cdbatch]
+            + [_make_attn_only_op(i) for i in range(N)]
+            + [_fwd_finalize]
+        )
 
     def build_bwd_subops(self) -> list:
         """
@@ -2071,14 +2413,14 @@ class BubbleTeaLoRATrainer:
         #                 sdpa_out     [T, q_sz]  for O LoRA grads (forward activation)
         #                 grad_o_local [T, H]     for O LoRA grads (backward seed)
         bwd_state: dict = {
-            "ok":          False,
+            "ok": False,
             "grad_hidden": None,
-            "positions":   None,
-            "loss":        0.0,
-            "layers":      {},
-            "_attn":       {},   # layer_idx → scratch dict for split attn bwd sub-ops
-            "_pending_gh": None, # deferred grad_hidden: in-flight exchange future
-                                 # + the linear tail ops postponed to consume time
+            "positions": None,
+            "loss": 0.0,
+            "layers": {},
+            "_attn": {},  # layer_idx → scratch dict for split attn bwd sub-ops
+            "_pending_gh": None,  # deferred grad_hidden: in-flight exchange future
+            # + the linear tail ops postponed to consume time
         }
 
         def _resolve_pending_grad_hidden():
@@ -2103,12 +2445,21 @@ class BubbleTeaLoRATrainer:
         def _lm_head_op():
             fwd = trainer._fwd
             if "hidden_last" not in fwd or "labels" not in fwd:
-                return   # forward not ready — all downstream sub-ops stay no-ops
+                log.debug(
+                    "[BubbleTea] bwd lm_head_op: fwd not ready (rank=%d)",
+                    trainer._tp_rank,
+                )
+                return  # forward not ready — all downstream sub-ops stay no-ops
+            log.debug(
+                "[BubbleTea] bwd lm_head_op: starting (rank=%d round=%d)",
+                trainer._tp_rank,
+                fwd.get("round", -1),
+            )
             try:
                 hidden_last = fwd["hidden_last"]
-                labels      = fwd["labels"]
-                T           = hidden_last.shape[0]
-                dev         = f"cuda:{trainer.device}"
+                labels = fwd["labels"]
+                T = hidden_last.shape[0]
+                dev = f"cuda:{trainer.device}"
 
                 # Apply the final RMSNorm before the LM head.  hidden_last is
                 # the raw post-FFN activation from layer 47; skipping the norm
@@ -2117,22 +2468,25 @@ class BubbleTeaLoRATrainer:
                 # Manual backward (no autograd): _rms_norm_bwd_x avoids holding
                 # the Python GIL, which blocked inference shm_broadcast when we
                 # tried .backward() from the bwd_stream worker thread.
-                if hasattr(trainer._norm, 'weight'):
+                if hasattr(trainer._norm, "weight"):
                     # Ensure weight is on the same device/dtype as hidden_last.
                     # EP weight filtering can leave non-expert weights on CPU.
-                    w_fn          = trainer._norm.weight.detach().to(
-                                        device=hidden_last.device,
-                                        dtype=hidden_last.dtype)
+                    w_fn = trainer._norm.weight.detach().to(
+                        device=hidden_last.device, dtype=hidden_last.dtype
+                    )
                     hidden_normed = _rms_norm(hidden_last, w_fn)
                     grad_local, loss_scalar, grad_fut = trainer._lm_head_grad(
-                        hidden_normed, labels, round_id=fwd.get("round"),
-                        async_grad=True)
+                        hidden_normed,
+                        labels,
+                        round_id=fwd.get("round"),
+                        async_grad=True,
+                    )
                     ln_x, ln_w = hidden_last, w_fn
                 else:
                     # Unit-test mock norm has no weight — fall through unchanged.
                     grad_local, loss_scalar, grad_fut = trainer._lm_head_grad(
-                        hidden_last, labels, round_id=fwd.get("round"),
-                        async_grad=True)
+                        hidden_last, labels, round_id=fwd.get("round"), async_grad=True
+                    )
                     ln_x = ln_w = None
                 # _lm_head_grad returns None when this rank's vocab shard has
                 # no valid target tokens (common on rank 1 for English text).
@@ -2145,20 +2499,26 @@ class BubbleTeaLoRATrainer:
                     # Vocab-parallel grad partial published async; layer N-1's
                     # first passthrough chunk resolves it. The final-norm
                     # backward is applied at consume time (linear in grad).
-                    bwd_state["_pending_gh"] = {"fut": grad_fut, "ln_x": ln_x,
-                                                 "ln_w": ln_w, "add": None}
+                    bwd_state["_pending_gh"] = {
+                        "fut": grad_fut,
+                        "ln_x": ln_x,
+                        "ln_w": ln_w,
+                        "add": None,
+                    }
                     bwd_state["grad_hidden"] = None
                 else:
                     g = grad_local
                     if ln_w is not None:
                         g = _rms_norm_bwd_x(g, ln_x, ln_w)
                     bwd_state["grad_hidden"] = g
-                bwd_state["positions"]   = torch.arange(T, device=dev, dtype=torch.long)
-                bwd_state["loss"]        = loss_scalar
+                bwd_state["positions"] = torch.arange(T, device=dev, dtype=torch.long)
+                bwd_state["loss"] = loss_scalar
             except Exception as exc:
                 import traceback as _tb
-                log.warning("[BubbleTea LoRA] bwd_lm_head error: %s\n%s",
-                            exc, _tb.format_exc())
+
+                log.warning(
+                    "[BubbleTea LoRA] bwd_lm_head error: %s\n%s", exc, _tb.format_exc()
+                )
                 bwd_state["ok"] = False
 
         # ── Per-layer passthrough sub-op factory ──────────────────────────────
@@ -2174,13 +2534,16 @@ class BubbleTeaLoRATrainer:
             The last chunk also runs the post-attn / attention / input-LN
             backward steps that require the fully accumulated grad_x2.
             """
-            layer   = trainer._layers[i]
-            n_ep    = trainer._ep_num_local_experts
-            n_c     = max(1, trainer._bwd_passthrough_chunks)
+            layer = trainer._layers[i]
+            n_ep = trainer._ep_num_local_experts
+            n_c = max(1, trainer._bwd_passthrough_chunks)
             # Expert indices are split as evenly as possible.
             chunk_borders = [round(n_ep * k / n_c) for k in range(n_c + 1)]
-            chunks = [(chunk_borders[k], chunk_borders[k + 1])
-                      for k in range(n_c) if chunk_borders[k] < chunk_borders[k + 1]]
+            chunks = [
+                (chunk_borders[k], chunk_borders[k + 1])
+                for k in range(n_c)
+                if chunk_borders[k] < chunk_borders[k + 1]
+            ]
             # Always emit at least one sub-op so the attention/LN backward
             # runs even when there are no local MoE experts (e.g. unit tests
             # with dense-only mock models, or EP rank with 0 active experts).
@@ -2189,7 +2552,7 @@ class BubbleTeaLoRATrainer:
 
             ops = []
             for chunk_idx, (e_start, e_end) in enumerate(chunks):
-                is_last = (chunk_idx == len(chunks) - 1)
+                is_last = chunk_idx == len(chunks) - 1
 
                 def _moe_chunk(e_s=e_start, e_e=e_end, last=is_last):
                     if not bwd_state["ok"]:
@@ -2200,8 +2563,8 @@ class BubbleTeaLoRATrainer:
                         # while the previous layer's LoRA-grad sub-ops fired.
                         _resolve_pending_grad_hidden()
 
-                        fwd_i   = trainer._fwd["layers"][i]
-                        x2      = fwd_i["x2"]
+                        fwd_i = trainer._fwd["layers"][i]
+                        x2 = fwd_i["x2"]
                         saved_gu = fwd_i.get("gate_up")
                         grad_hidden = bwd_state["grad_hidden"]
 
@@ -2213,9 +2576,12 @@ class BubbleTeaLoRATrainer:
 
                         # Accumulate this expert chunk's contribution.
                         trainer._moe_backward_passthrough(
-                            x2, grad_hidden, layer.mlp,
+                            x2,
+                            grad_hidden,
+                            layer.mlp,
                             saved_gate_up=saved_gu,
-                            e_start=e_s, e_end=e_e,
+                            e_start=e_s,
+                            e_end=e_e,
                             grad_x2_acc=partial,
                         )
 
@@ -2226,8 +2592,56 @@ class BubbleTeaLoRATrainer:
                         # Attn backward is split into 4 separate bubble sub-ops
                         # (_attn_qkv_recompute, _attn_o_proj_bwd, _attn_sdpa_bwd,
                         # _attn_qkv_bwd) that follow this op in the sub-op list.
-                        grad_x2  = partial
+                        grad_x2 = partial
                         bwd_state["_grad_x2_partial"] = None  # free accumulator
+
+                        # Shared expert backward (Qwen1.5-MoE / Qwen2-MoE only).
+                        # The shared expert output is added to `output` in the
+                        # forward, so its grad_x2 contribution is additive here.
+                        se = getattr(layer.mlp, "shared_expert", None)
+                        if se is not None:
+                            saved_se_gu = (fwd_i.get("gate_up") or {}).get("shared")
+                            gu_w = se.gate_up_proj.weight.detach()  # [2*d_local, H]
+                            d_w = se.down_proj.weight.detach()  # [H, d_local]
+                            if saved_se_gu is not None:
+                                gate_up = saved_se_gu  # [T, 2*d_local]
+                            else:
+                                gate_up = x2 @ gu_w.T  # recompute
+                            d_local = gate_up.shape[-1] // 2
+                            gate = gate_up[:, :d_local]  # [T, d_local]
+                            up = gate_up[:, d_local:]
+                            se_mlp_out = F.linear(
+                                F.silu(gate) * up, d_w
+                            )  # [T, H] partial
+
+                            if getattr(se, "expert_gate", None) is not None:
+                                sg_w = se.expert_gate.weight.detach()  # [1, H]
+                                gate_scalar = x2 @ sg_w.T  # [T, 1]
+                                se_gate = torch.sigmoid(gate_scalar)  # [T, 1]
+                                # grad through gating scalar applied to se_mlp_out
+                                grad_mlp = grad_hidden * se_gate  # [T, H]
+                                sig_d = se_gate * (1.0 - se_gate)
+                                grad_sg = (grad_hidden * se_mlp_out).sum(
+                                    -1, keepdim=True
+                                ) * sig_d  # [T,1]
+                                grad_x2 += grad_sg @ sg_w  # [T, H]
+                            else:
+                                grad_mlp = grad_hidden
+
+                            # Backward through down_proj: grad_act = grad_mlp @ d_w
+                            grad_act = (
+                                grad_mlp @ d_w
+                            )  # [T, H]@[H, d_local] = [T, d_local]
+                            # Backward through SwiGLU
+                            sig_g = torch.sigmoid(gate)
+                            silu_deriv = sig_g * (1.0 + gate * (1.0 - sig_g))
+                            grad_gate = grad_act * silu_deriv * up
+                            grad_up = grad_act * F.silu(gate)
+                            grad_gu = torch.cat(
+                                [grad_gate, grad_up], dim=-1
+                            )  # [T, 2*d_local]
+                            # Backward through gate_up_proj: grad_x2 += grad_gu @ gu_w
+                            grad_x2 += grad_gu @ gu_w  # [T, H]
 
                         # Item 9: grad_x2 only carries this rank's local
                         # experts' contributions (EP-sharded). Both ranks hold
@@ -2239,20 +2653,32 @@ class BubbleTeaLoRATrainer:
                         # exchange. Without this exchange, grad_o_local (and
                         # everything propagated to lower layers) is partial,
                         # breaking the items-3-5 summation math.
-                        if (trainer._tp_correct and trainer._ep_size > 1
-                                and hasattr(layer.mlp, 'gate')):
+                        if (
+                            trainer._tp_correct
+                            and trainer._ep_size > 1
+                            and hasattr(layer.mlp, "gate")
+                        ):
                             grad_x2_fut = trainer._tp_correct_exchange_sum_async(
-                                grad_x2.contiguous(), f"moebwd_{i}",
-                                trainer._fwd.get("round", trainer._fwd_round))
+                                grad_x2.contiguous(),
+                                f"moebwd_{i}",
+                                trainer._fwd.get("round", trainer._fwd_round),
+                            )
                         else:
                             grad_x2_fut = _TpCorrectFuture.preset(grad_x2)
 
                         bwd_state["_attn"][i] = {"grad_x2_fut": grad_x2_fut}
                     except Exception as exc:
                         import traceback as _tb
+
                         log.warning(
-                            "[BubbleTea LoRA] bwd_passthrough_%d chunk %d-%d error: %s\n%s",
-                            i, e_s, e_e, exc, _tb.format_exc())
+                            "[BubbleTea LoRA] bwd_passthrough_%d"
+                            " chunk %d-%d error: %s\n%s",
+                            i,
+                            e_s,
+                            e_e,
+                            exc,
+                            _tb.format_exc(),
+                        )
                         bwd_state["ok"] = False
 
                 _moe_chunk.__name__ = "_passthrough"
@@ -2274,26 +2700,27 @@ class BubbleTeaLoRATrainer:
             the moebwd_{i} exchange published by the last passthrough chunk
             completes behind it, and _attn_o_proj_bwd consumes the future.
             """
-            layer      = trainer._layers[i]
+            layer = trainer._layers[i]
             layer_attn = layer.self_attn
 
             def _attn_o_proj_bwd():
                 if not bwd_state["ok"]:
                     return
                 try:
-                    scaling  = _LORA_ALPHA / 16
-                    lora_d   = trainer._lora.get(i, {})
-                    scratch  = bwd_state["_attn"][i]
+                    scaling = _LORA_ALPHA / 16
+                    lora_d = trainer._lora.get(i, {})
+                    scratch = bwd_state["_attn"][i]
 
                     # Consume the moebwd_{i} future, then finish what used to
                     # be the last chunk's tail: post-attn LN backward +
                     # residual to get grad_o_local.
                     grad_x2 = scratch.pop("grad_x2_fut").result()
-                    fwd_i   = trainer._fwd["layers"][i]
-                    res_b   = (fwd_i["attn_out"] + fwd_i["res_a"]).detach()
-                    w_post  = layer.post_attention_layernorm.weight.detach().to(
-                        device=res_b.device, dtype=res_b.dtype)
-                    grad_res_b   = _rms_norm_bwd_x(grad_x2, res_b, w_post)
+                    fwd_i = trainer._fwd["layers"][i]
+                    res_b = (fwd_i["attn_out"] + fwd_i["res_a"]).detach()
+                    w_post = layer.post_attention_layernorm.weight.detach().to(
+                        device=res_b.device, dtype=res_b.dtype
+                    )
+                    grad_res_b = _rms_norm_bwd_x(grad_x2, res_b, w_post)
                     grad_o_local = grad_res_b + bwd_state["grad_hidden"]
                     scratch["grad_o_local"] = grad_o_local
 
@@ -2306,110 +2733,149 @@ class BubbleTeaLoRATrainer:
 
                     grad_sdpa_out = grad_o_local.to(o_w.dtype) @ o_w
                     if A_o is not None and B_o is not None:
-                        grad_z        = grad_o_local.to(B_o.dtype) @ B_o * scaling
+                        grad_z = grad_o_local.to(B_o.dtype) @ B_o * scaling
                         grad_sdpa_out = grad_sdpa_out + grad_z.to(A_o.dtype) @ A_o
 
                     scratch["grad_sdpa_out"] = grad_sdpa_out
                 except Exception as exc:
                     log.warning("[BubbleTea LoRA] attn_o_proj_bwd_%d error: %s", i, exc)
                     bwd_state["ok"] = False
+
             _attn_o_proj_bwd.__name__ = "_attn_o_proj_bwd"
 
             def _attn_qkv_recompute():
                 if not bwd_state["ok"]:
                     return
                 try:
-                    scaling  = _LORA_ALPHA / 16
-                    lora_d   = trainer._lora.get(i, {})
-                    x_norm   = trainer._fwd["layers"][i]["x_norm"]
+                    scaling = _LORA_ALPHA / 16
+                    lora_d = trainer._lora.get(i, {})
+                    x_norm = trainer._fwd["layers"][i]["x_norm"]
                     positions = bwd_state["positions"]
-                    T    = x_norm.shape[0]
-                    nh   = trainer._n_heads_local
-                    nkv  = trainer._n_kv_local
-                    hd   = _HEAD_DIM
-                    q_sz  = nh  * hd
+                    T = x_norm.shape[0]
+                    nh = trainer._n_heads_local
+                    nkv = trainer._n_kv_local
+                    hd = _HEAD_DIM
+                    q_sz = nh * hd
                     kv_sz = nkv * hd
 
-                    qkv_w  = layer_attn.qkv_proj.weight.detach()
+                    qkv_w = layer_attn.qkv_proj.weight.detach()
                     q_base = F.linear(x_norm.detach(), qkv_w[:q_sz])
-                    k_base = F.linear(x_norm.detach(), qkv_w[q_sz:q_sz + kv_sz])
-                    v_base = F.linear(x_norm.detach(), qkv_w[q_sz + kv_sz:])
+                    k_base = F.linear(x_norm.detach(), qkv_w[q_sz : q_sz + kv_sz])
+                    v_base = F.linear(x_norm.detach(), qkv_w[q_sz + kv_sz :])
 
                     xf = x_norm.detach().float()
                     prev_q = getattr(trainer, f"_prev_delta_{i}_q_proj", None)
                     if prev_q is not None:
-                        q_base = (q_base.float() - F.linear(xf, prev_q.float())).to(q_base.dtype)
+                        q_base = (q_base.float() - F.linear(xf, prev_q.float())).to(
+                            q_base.dtype
+                        )
+                    prev_k = getattr(trainer, f"_prev_delta_{i}_k_proj", None)
+                    if prev_k is not None:
+                        k_base = (k_base.float() - F.linear(xf, prev_k.float())).to(
+                            k_base.dtype
+                        )
                     prev_v = getattr(trainer, f"_prev_delta_{i}_v_proj", None)
                     if prev_v is not None:
-                        v_base = (v_base.float() - F.linear(xf, prev_v.float())).to(v_base.dtype)
+                        v_base = (v_base.float() - F.linear(xf, prev_v.float())).to(
+                            v_base.dtype
+                        )
 
                     A_q = lora_d.get("q_proj.lora_A")
                     B_q = lora_d.get("q_proj.lora_B")
+                    A_k = lora_d.get("k_proj.lora_A")
+                    B_k = lora_d.get("k_proj.lora_B")
                     A_v = lora_d.get("v_proj.lora_A")
                     B_v = lora_d.get("v_proj.lora_B")
 
                     xd = x_norm.detach()
-                    q = q_base + ((xd @ A_q.T.to(xd.dtype)) @ B_q.T.to(xd.dtype) * scaling
-                                  if A_q is not None and B_q is not None else 0)
-                    v = v_base + ((xd @ A_v.T.to(xd.dtype)) @ B_v.T.to(xd.dtype) * scaling
-                                  if A_v is not None and B_v is not None else 0)
+                    q = q_base + (
+                        (xd @ A_q.T.to(xd.dtype)) @ B_q.T.to(xd.dtype) * scaling
+                        if A_q is not None and B_q is not None
+                        else 0
+                    )
+                    k = k_base + (
+                        (xd @ A_k.T.to(xd.dtype)) @ B_k.T.to(xd.dtype) * scaling
+                        if A_k is not None and B_k is not None
+                        else 0
+                    )
+                    v = v_base + (
+                        (xd @ A_v.T.to(xd.dtype)) @ B_v.T.to(xd.dtype) * scaling
+                        if A_v is not None and B_v is not None
+                        else 0
+                    )
 
-                    q_normed = layer_attn.q_norm(q.view(T, nh,  hd)).view(T, q_sz)
-                    k_normed = layer_attn.k_norm(k_base.view(T, nkv, hd)).view(T, kv_sz)
+                    if hasattr(layer_attn, "q_norm"):
+                        q_normed = layer_attn.q_norm(q.view(T, nh, hd)).view(T, q_sz)
+                        k_normed = layer_attn.k_norm(k.view(T, nkv, hd)).view(T, kv_sz)
+                    else:
+                        q_normed, k_normed = q, k
                     q_rot, k_rot = layer_attn.rotary_emb(positions, q_normed, k_normed)
 
                     scratch = bwd_state["_attn"][i]
-                    scratch.update({
-                        "q": q, "v": v, "k_rot": k_rot,
-                        "q_normed": q_normed, "k_normed": k_normed, "q_rot": q_rot,
-                    })
+                    scratch.update(
+                        {
+                            "q": q,
+                            "k": k,
+                            "v": v,
+                            "k_rot": k_rot,
+                            "q_normed": q_normed,
+                            "k_normed": k_normed,
+                            "q_rot": q_rot,
+                        }
+                    )
                 except Exception as exc:
-                    log.warning("[BubbleTea LoRA] attn_qkv_recompute_%d error: %s", i, exc)
+                    log.warning(
+                        "[BubbleTea LoRA] attn_qkv_recompute_%d error: %s", i, exc
+                    )
                     bwd_state["ok"] = False
+
             _attn_qkv_recompute.__name__ = "_attn_qkv_recompute"
 
             def _attn_sdpa_bwd():
                 if not bwd_state["ok"]:
                     return
                 try:
-                    scratch   = bwd_state["_attn"][i]
-                    fwd_i     = trainer._fwd["layers"][i]
-                    T         = fwd_i["x_norm"].shape[0]
-                    nh        = trainer._n_heads_local
-                    nkv       = trainer._n_kv_local
-                    hd        = _HEAD_DIM
-                    q_sz      = nh  * hd
+                    scratch = bwd_state["_attn"][i]
+                    fwd_i = trainer._fwd["layers"][i]
+                    T = fwd_i["x_norm"].shape[0]
+                    nh = trainer._n_heads_local
+                    nkv = trainer._n_kv_local
+                    hd = _HEAD_DIM
+                    q_sz = nh * hd
                     positions = bwd_state["positions"]
 
-                    q_rot         = scratch["q_rot"]
-                    v             = scratch["v"]
-                    k_rot         = scratch["k_rot"]
-                    q_normed      = scratch["q_normed"]
-                    k_normed      = scratch["k_normed"]
+                    q_rot = scratch["q_rot"]
+                    v = scratch["v"]
+                    k_rot = scratch["k_rot"]
+                    q_normed = scratch["q_normed"]
+                    k_normed = scratch["k_normed"]
                     grad_sdpa_out = scratch["grad_sdpa_out"]
 
                     with torch.enable_grad():
                         q_leaf = q_rot.detach().requires_grad_(True)
+                        k_leaf = k_rot.detach().requires_grad_(True)
                         v_leaf = v.detach().requires_grad_(True)
-                        k_det  = k_rot.detach()
 
-                        q3 = q_leaf.view(T, nh,  hd).transpose(0, 1).unsqueeze(0)
-                        k3 = k_det.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)
+                        q3 = q_leaf.view(T, nh, hd).transpose(0, 1).unsqueeze(0)
+                        k3 = k_leaf.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)
                         v3 = v_leaf.view(T, nkv, hd).transpose(0, 1).unsqueeze(0)
                         if nkv < nh:
                             rep = nh // nkv
-                            k3  = k3.repeat_interleave(rep, dim=1)
-                            v3  = v3.repeat_interleave(rep, dim=1)
+                            k3 = k3.repeat_interleave(rep, dim=1)
+                            v3 = v3.repeat_interleave(rep, dim=1)
 
-                        sdpa = F.scaled_dot_product_attention(q3, k3, v3, is_causal=True)
+                        sdpa = F.scaled_dot_product_attention(
+                            q3, k3, v3, is_causal=True
+                        )
                         sdpa = sdpa.squeeze(0).transpose(0, 1).reshape(T, q_sz)
                         sdpa_out = sdpa.detach()
                         sdpa.backward(grad_sdpa_out.to(sdpa.dtype))
 
                     grad_q_rot = q_leaf.grad
-                    grad_v     = v_leaf.grad
+                    grad_k_rot = k_leaf.grad
+                    grad_v = v_leaf.grad
 
-                    # RoPE backward (mini autograd on q branch only)
+                    # RoPE backward (mini autograd, separate passes for Q and K)
                     with torch.enable_grad():
                         q_normed_leaf = q_normed.detach().requires_grad_(True)
                         q_rot_mini, _ = layer_attn.rotary_emb(
@@ -2418,49 +2884,69 @@ class BubbleTeaLoRATrainer:
                         q_rot_mini.backward(grad_q_rot.to(q_rot_mini.dtype))
                     grad_q_normed = q_normed_leaf.grad
 
-                    scratch.update({
-                        "grad_v": grad_v,
-                        "grad_q_normed": grad_q_normed,
-                        "sdpa_out": sdpa_out,
-                    })
+                    with torch.enable_grad():
+                        k_normed_leaf = k_normed.detach().requires_grad_(True)
+                        _, k_rot_mini = layer_attn.rotary_emb(
+                            positions, q_normed.detach(), k_normed_leaf
+                        )
+                        k_rot_mini.backward(grad_k_rot.to(k_rot_mini.dtype))
+                    grad_k_normed = k_normed_leaf.grad
+
+                    scratch.update(
+                        {
+                            "grad_v": grad_v,
+                            "grad_q_normed": grad_q_normed,
+                            "grad_k_normed": grad_k_normed,
+                            "sdpa_out": sdpa_out,
+                        }
+                    )
                 except Exception as exc:
                     log.warning("[BubbleTea LoRA] attn_sdpa_bwd_%d error: %s", i, exc)
                     bwd_state["ok"] = False
+
             _attn_sdpa_bwd.__name__ = "_attn_sdpa_bwd"
 
             def _attn_qkv_bwd():
                 if not bwd_state["ok"]:
                     return
                 try:
-                    scratch  = bwd_state["_attn"][i]
-                    fwd_i    = trainer._fwd["layers"][i]
-                    x_norm   = fwd_i["x_norm"]
-                    res_a    = fwd_i["res_a"]
-                    lora_d   = trainer._lora.get(i, {})
-                    scaling  = _LORA_ALPHA / 16
-                    T        = x_norm.shape[0]
-                    nh       = trainer._n_heads_local
-                    nkv      = trainer._n_kv_local
-                    hd       = _HEAD_DIM
-                    q_sz     = nh  * hd
-                    kv_sz    = nkv * hd
+                    scratch = bwd_state["_attn"][i]
+                    fwd_i = trainer._fwd["layers"][i]
+                    x_norm = fwd_i["x_norm"]
+                    res_a = fwd_i["res_a"]
+                    lora_d = trainer._lora.get(i, {})
+                    scaling = _LORA_ALPHA / 16
+                    T = x_norm.shape[0]
+                    nh = trainer._n_heads_local
+                    nkv = trainer._n_kv_local
+                    hd = _HEAD_DIM
+                    q_sz = nh * hd
+                    kv_sz = nkv * hd
 
-                    grad_o_local  = scratch["grad_o_local"]
+                    grad_o_local = scratch["grad_o_local"]
                     grad_q_normed = scratch["grad_q_normed"]
-                    grad_v        = scratch["grad_v"]
-                    sdpa_out      = scratch["sdpa_out"]
-                    q             = scratch["q"]
+                    grad_k_normed = scratch["grad_k_normed"]
+                    grad_v = scratch["grad_v"]
+                    sdpa_out = scratch["sdpa_out"]
+                    q = scratch["q"]
+                    k = scratch["k"]
 
                     A_q = lora_d.get("q_proj.lora_A")
                     B_q = lora_d.get("q_proj.lora_B")
+                    A_k = lora_d.get("k_proj.lora_A")
+                    B_k = lora_d.get("k_proj.lora_B")
                     A_v = lora_d.get("v_proj.lora_A")
                     B_v = lora_d.get("v_proj.lora_B")
                     qkv_w = layer_attn.qkv_proj.weight.detach()
 
-                    # QK-norm backward
+                    # QK-norm backward for Q (skipped when no q_norm, e.g. Qwen1.5-MoE)
                     q_det = q.detach()
-                    if hasattr(layer_attn.q_norm, 'weight'):
-                        w_qn = layer_attn.q_norm.weight.detach().to(q_det.device, q_det.dtype)
+                    if hasattr(layer_attn, "q_norm") and hasattr(
+                        layer_attn.q_norm, "weight"
+                    ):
+                        w_qn = layer_attn.q_norm.weight.detach().to(
+                            q_det.device, q_det.dtype
+                        )
                         grad_q_pre_norm = _rms_norm_bwd_x(
                             grad_q_normed.reshape(T * nh, hd),
                             q_det.reshape(T * nh, hd),
@@ -2469,20 +2955,45 @@ class BubbleTeaLoRATrainer:
                     else:
                         grad_q_pre_norm = grad_q_normed
 
+                    # QK-norm backward for K (skipped when no k_norm, e.g. Qwen1.5-MoE)
+                    k_det = k.detach()
+                    if hasattr(layer_attn, "k_norm") and hasattr(
+                        layer_attn.k_norm, "weight"
+                    ):
+                        w_kn = layer_attn.k_norm.weight.detach().to(
+                            k_det.device, k_det.dtype
+                        )
+                        grad_k_pre_norm = _rms_norm_bwd_x(
+                            grad_k_normed.reshape(T * nkv, hd),
+                            k_det.reshape(T * nkv, hd),
+                            w_kn,
+                        ).reshape(T, kv_sz)
+                    else:
+                        grad_k_pre_norm = grad_k_normed
+
                     # QKV projection backward
                     dt = qkv_w.dtype
-                    grad_x_norm  = (grad_q_pre_norm.to(dt) @ qkv_w[:q_sz]).to(x_norm.dtype)
-                    grad_x_norm += (grad_v.to(dt) @ qkv_w[q_sz + kv_sz:]).to(x_norm.dtype)
+                    grad_x_norm = (grad_q_pre_norm.to(dt) @ qkv_w[:q_sz]).to(
+                        x_norm.dtype
+                    )
+                    grad_x_norm += (
+                        grad_k_pre_norm.to(dt) @ qkv_w[q_sz : q_sz + kv_sz]
+                    ).to(x_norm.dtype)
+                    grad_x_norm += (grad_v.to(dt) @ qkv_w[q_sz + kv_sz :]).to(
+                        x_norm.dtype
+                    )
                     if A_q is not None and B_q is not None:
-                        grad_z_q     = grad_q_pre_norm.to(B_q.dtype) @ B_q * scaling
+                        grad_z_q = grad_q_pre_norm.to(B_q.dtype) @ B_q * scaling
                         grad_x_norm += (grad_z_q @ A_q).to(x_norm.dtype)
+                    if A_k is not None and B_k is not None:
+                        grad_z_k = grad_k_pre_norm.to(B_k.dtype) @ B_k * scaling
+                        grad_x_norm += (grad_z_k @ A_k).to(x_norm.dtype)
                     if A_v is not None and B_v is not None:
-                        grad_z_v     = grad_v.to(B_v.dtype) @ B_v * scaling
+                        grad_z_v = grad_v.to(B_v.dtype) @ B_v * scaling
                         grad_x_norm += (grad_z_v @ A_v).to(x_norm.dtype)
 
-                    # grad_x_norm only carries this rank's local Q/V heads'
-                    # contributions (qkv_proj is colwise-sharded; the K path
-                    # is dropped identically on all ranks). Exchange-sum so
+                    # grad_x_norm carries this rank's local Q/K/V heads'
+                    # contributions (qkv_proj is colwise-sharded). Exchange-sum so
                     # the grad_hidden propagated to layer i-1 is the full
                     # gradient — without this, every layer below the top gets
                     # a partial seed and the items-3-5 grad summation at
@@ -2495,14 +3006,21 @@ class BubbleTeaLoRATrainer:
                     # (linear in the gradient, so the order is equivalent).
                     # i == 0 has no consumer — no exchange at all.
                     res_a_det = res_a.detach()
-                    w_in = trainer._layers[i].input_layernorm.weight.detach().to(
-                        res_a_det.device, res_a_det.dtype)
+                    w_in = (
+                        trainer._layers[i]
+                        .input_layernorm.weight.detach()
+                        .to(res_a_det.device, res_a_det.dtype)
+                    )
                     if i > 0 and trainer._tp_correct and trainer._tp_size > 1:
                         gx_fut = trainer._tp_correct_exchange_sum_async(
-                            grad_x_norm.contiguous(), f"attnbwd_{i}",
-                            trainer._fwd.get("round", trainer._fwd_round))
+                            grad_x_norm.contiguous(),
+                            f"attnbwd_{i}",
+                            trainer._fwd.get("round", trainer._fwd_round),
+                        )
                         bwd_state["_pending_gh"] = {
-                            "fut": gx_fut, "ln_x": res_a_det, "ln_w": w_in,
+                            "fut": gx_fut,
+                            "ln_x": res_a_det,
+                            "ln_w": w_in,
                             "add": grad_o_local,
                         }
                         bwd_state["grad_hidden"] = None  # set at consume time
@@ -2512,18 +3030,25 @@ class BubbleTeaLoRATrainer:
 
                     # Store results for LoRA grad sub-ops; free attn scratch
                     bwd_state["layers"][i] = {
-                        "grad_q":       grad_q_pre_norm,
-                        "grad_v":       grad_v,
-                        "sdpa_out":     sdpa_out,
+                        "grad_q": grad_q_pre_norm,
+                        "grad_k": grad_k_pre_norm,
+                        "grad_v": grad_v,
+                        "sdpa_out": sdpa_out,
                         "grad_o_local": grad_o_local,
                     }
                     del bwd_state["_attn"][i]
                 except Exception as exc:
                     log.warning("[BubbleTea LoRA] attn_qkv_bwd_%d error: %s", i, exc)
                     bwd_state["ok"] = False
+
             _attn_qkv_bwd.__name__ = "_attn_qkv_bwd"
 
-            return [_attn_qkv_recompute, _attn_o_proj_bwd, _attn_sdpa_bwd, _attn_qkv_bwd]
+            return [
+                _attn_qkv_recompute,
+                _attn_o_proj_bwd,
+                _attn_sdpa_bwd,
+                _attn_qkv_bwd,
+            ]
 
         # ── Per-layer Q LoRA grad sub-op factory ─────────────────────────────
         def _make_q_lora_op(i: int):
@@ -2538,13 +3063,15 @@ class BubbleTeaLoRATrainer:
                     B_q = lora_d.get("q_proj.lora_B")  # [q_sz_local, r] — sharded
                     if A_q is None or B_q is None:
                         return
-                    x_norm = trainer._fwd["layers"][i]["x_norm"]   # [T, H]
-                    grad_q = bwd_state["layers"][i]["grad_q"]       # [T, q_sz_local]
+                    x_norm = trainer._fwd["layers"][i]["x_norm"]  # [T, H]
+                    grad_q = bwd_state["layers"][i]["grad_q"]  # [T, q_sz_local]
                     with torch.no_grad():
-                        z    = x_norm.to(A_q.dtype) @ A_q.T                # [T, r]
-                        gz   = grad_q.to(B_q.dtype) @ B_q * scaling        # [T, r]
-                        dA   = (gz.T @ x_norm.to(gz.dtype)).to(A_q.dtype)  # [r, H]
-                        dB   = (grad_q.to(B_q.dtype).T @ z.to(B_q.dtype) * scaling).to(B_q.dtype)  # [q_sz_local, r]
+                        z = x_norm.to(A_q.dtype) @ A_q.T  # [T, r]
+                        gz = grad_q.to(B_q.dtype) @ B_q * scaling  # [T, r]
+                        dA = (gz.T @ x_norm.to(gz.dtype)).to(A_q.dtype)  # [r, H]
+                        dB = (grad_q.to(B_q.dtype).T @ z.to(B_q.dtype) * scaling).to(
+                            B_q.dtype
+                        )  # [q_sz_local, r]
                         # dA is partial (only rank 1's Q-head slice contributes) but
                         # all-reducing here would deadlock: backward runs only on the
                         # EP-light rank in the bubble scheduler thread.
@@ -2555,6 +3082,36 @@ class BubbleTeaLoRATrainer:
                     bwd_state["ok"] = False
 
             return _q_lora
+
+        # ── Per-layer K LoRA grad sub-op factory ─────────────────────────────
+        def _make_k_lora_op(i: int):
+            scaling = _LORA_ALPHA / 16
+
+            def _k_lora():
+                if not bwd_state["ok"]:
+                    return
+                try:
+                    lora_d = trainer._lora.get(i, {})
+                    A_k = lora_d.get("k_proj.lora_A")  # [r, H]   — replicated across TP
+                    B_k = lora_d.get("k_proj.lora_B")  # [kv_sz_local, r] — sharded
+                    if A_k is None or B_k is None:
+                        return
+                    x_norm = trainer._fwd["layers"][i]["x_norm"]  # [T, H]
+                    grad_k = bwd_state["layers"][i]["grad_k"]  # [T, kv_sz_local]
+                    with torch.no_grad():
+                        z = x_norm.to(A_k.dtype) @ A_k.T  # [T, r]
+                        gz = grad_k.to(B_k.dtype) @ B_k * scaling  # [T, r]
+                        dA = (gz.T @ x_norm.to(gz.dtype)).to(A_k.dtype)  # [r, H]
+                        dB = (grad_k.to(B_k.dtype).T @ z.to(B_k.dtype) * scaling).to(
+                            B_k.dtype
+                        )
+                    A_k.grad = dA if A_k.grad is None else A_k.grad.add_(dA)
+                    B_k.grad = dB if B_k.grad is None else B_k.grad.add_(dB)
+                except Exception as exc:
+                    log.debug("[BubbleTea LoRA] bwd_k_lora_%d error: %s", i, exc)
+                    bwd_state["ok"] = False
+
+            return _k_lora
 
         # ── Per-layer V LoRA grad sub-op factory ─────────────────────────────
         def _make_v_lora_op(i: int):
@@ -2569,13 +3126,15 @@ class BubbleTeaLoRATrainer:
                     B_v = lora_d.get("v_proj.lora_B")  # [kv_sz, r]
                     if A_v is None or B_v is None:
                         return
-                    x_norm = trainer._fwd["layers"][i]["x_norm"]   # [T, H]
-                    grad_v = bwd_state["layers"][i]["grad_v"]       # [T, kv_sz]
+                    x_norm = trainer._fwd["layers"][i]["x_norm"]  # [T, H]
+                    grad_v = bwd_state["layers"][i]["grad_v"]  # [T, kv_sz]
                     with torch.no_grad():
-                        z    = x_norm.to(A_v.dtype) @ A_v.T                # [T, r]
-                        gz   = grad_v.to(B_v.dtype) @ B_v * scaling        # [T, r]
-                        dA   = (gz.T @ x_norm.to(gz.dtype)).to(A_v.dtype)  # [r, H]
-                        dB   = (grad_v.to(B_v.dtype).T @ z.to(B_v.dtype) * scaling).to(B_v.dtype)  # [kv_sz_local, r]
+                        z = x_norm.to(A_v.dtype) @ A_v.T  # [T, r]
+                        gz = grad_v.to(B_v.dtype) @ B_v * scaling  # [T, r]
+                        dA = (gz.T @ x_norm.to(gz.dtype)).to(A_v.dtype)  # [r, H]
+                        dB = (grad_v.to(B_v.dtype).T @ z.to(B_v.dtype) * scaling).to(
+                            B_v.dtype
+                        )  # [kv_sz_local, r]
                         # dA partial — same asymmetric-backward constraint as Q.
                     A_v.grad = dA if A_v.grad is None else A_v.grad.add_(dA)
                     B_v.grad = dB if B_v.grad is None else B_v.grad.add_(dB)
@@ -2598,14 +3157,18 @@ class BubbleTeaLoRATrainer:
                     B_o = lora_d.get("o_proj.lora_B")  # [H, r]
                     if A_o is None or B_o is None:
                         return
-                    layer_bwd    = bwd_state["layers"][i]
-                    sdpa_out     = layer_bwd["sdpa_out"]      # [T, q_sz]
+                    layer_bwd = bwd_state["layers"][i]
+                    sdpa_out = layer_bwd["sdpa_out"]  # [T, q_sz]
                     grad_o_local = layer_bwd["grad_o_local"]  # [T, H]
                     with torch.no_grad():
-                        z_o  = sdpa_out.to(A_o.dtype) @ A_o.T                    # [T, r]
-                        gz_o = grad_o_local.to(B_o.dtype) @ B_o * scaling        # [T, r]
-                        dA   = (gz_o.T @ sdpa_out.to(gz_o.dtype)).to(A_o.dtype)  # [r, q_sz_local]
-                        dB   = (grad_o_local.to(B_o.dtype).T @ z_o.to(B_o.dtype) * scaling).to(B_o.dtype)  # [H, r]
+                        z_o = sdpa_out.to(A_o.dtype) @ A_o.T  # [T, r]
+                        gz_o = grad_o_local.to(B_o.dtype) @ B_o * scaling  # [T, r]
+                        dA = (gz_o.T @ sdpa_out.to(gz_o.dtype)).to(
+                            A_o.dtype
+                        )  # [r, q_sz_local]
+                        dB = (
+                            grad_o_local.to(B_o.dtype).T @ z_o.to(B_o.dtype) * scaling
+                        ).to(B_o.dtype)  # [H, r]
                         # dB partial — same asymmetric-backward constraint.
                     A_o.grad = dA if A_o.grad is None else A_o.grad.add_(dA)
                     B_o.grad = dB if B_o.grad is None else B_o.grad.add_(dB)
@@ -2614,8 +3177,11 @@ class BubbleTeaLoRATrainer:
                     # exchange per layer) instead of one ~19 MB pack at
                     # optimizer time — by the time the sweep reaches layer 0,
                     # the upper layers' exchanges have completed behind it.
-                    if (trainer._tp_correct and trainer._tp_size > 1
-                            and (trainer._step + 1) % trainer.accum_steps == 0):
+                    if (
+                        trainer._tp_correct
+                        and trainer._tp_size > 1
+                        and (trainer._step + 1) % trainer.accum_steps == 0
+                    ):
                         trainer._publish_layer_grads(i)
                     # Free this layer's backward intermediates now that all three
                     # LoRA grad ops for layer i have run.
@@ -2630,20 +3196,35 @@ class BubbleTeaLoRATrainer:
         def _optimizer_op():
             try:
                 if not bwd_state["ok"]:
+                    log.debug(
+                        "[BubbleTea] optimizer_op skipped: ok=False (rank=%d step=%d)",
+                        trainer._tp_rank,
+                        trainer._step,
+                    )
                     return
+                log.debug(
+                    "[BubbleTea] optimizer_op: step=%d accum=%d/%d (rank=%d)",
+                    trainer._step,
+                    (trainer._step % trainer.accum_steps) + 1,
+                    trainer.accum_steps,
+                    trainer._tp_rank,
+                )
                 trainer.total_loss += bwd_state["loss"]
                 trainer._step += 1
                 if trainer._step % trainer.accum_steps == 0:
                     trainer.optimizer_step()
             except Exception as exc:
+                import warnings as _w
+
+                _w.warn(f"[BubbleTea LoRA] bwd_optimizer error: {exc}", stacklevel=1)
                 log.debug("[BubbleTea LoRA] bwd_optimizer error: %s", exc)
             finally:
                 trainer._fwd.clear()
-                bwd_state["ok"]          = False
+                bwd_state["ok"] = False
                 bwd_state["grad_hidden"] = None
                 bwd_state["_pending_gh"] = None
-                bwd_state["positions"]   = None
-                bwd_state["loss"]        = 0.0
+                bwd_state["positions"] = None
+                bwd_state["loss"] = 0.0
                 bwd_state["layers"].clear()
                 # Drop streamed grad futures left by a round that failed
                 # before its optimizer step consumed them (a successful step
@@ -2652,8 +3233,8 @@ class BubbleTeaLoRATrainer:
                 if stale:
                     stale.clear()
 
-        # ── Assembly: (N_chunks+4)*N + N*3 + 2 sub-ops in strict backward order
-        # Per layer: N_chunks passthrough chunks + 4 attn bwd sub-ops + 3 LoRA ops
+        # ── Assembly: (N_chunks+4+4)*N + 2 sub-ops in strict backward order ─────
+        # Per layer: N_chunks passthrough + 4 attn bwd + 4 LoRA (Q/K/V/O) sub-ops
         return (
             [_lm_head_op]
             + [
@@ -2663,6 +3244,7 @@ class BubbleTeaLoRATrainer:
                     *_make_passthrough_chunk_ops(i),
                     *_make_attn_bwd_ops(i),
                     _make_q_lora_op(i),
+                    _make_k_lora_op(i),
                     _make_v_lora_op(i),
                     _make_o_lora_op(i),
                 )
@@ -2676,6 +3258,6 @@ class BubbleTeaLoRATrainer:
         """Return stats compatible with the compare_benchmark.py JSON schema."""
         return {
             "training_steps": self.completed_steps,
-            "peft_samples_s": None,   # filled in by compare_benchmark after run
+            "peft_samples_s": None,  # filled in by compare_benchmark after run
             "note": f"real LoRA (q/k/v/o, rank=16, alpaca-cleaned, t_ft={self.t_ft})",
         }
