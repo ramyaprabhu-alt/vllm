@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 # ── Bubble profiling ──────────────────────────────────────────────────────────
 def _bubble_profile_enabled() -> bool:
     return os.environ.get("VLLM_BUBBLE_PROFILE", "0") == "1"
@@ -341,12 +345,45 @@ def ft_moe_advance(ft_out: "torch.Tensor") -> None:
 _combined_demo_armed: bool = False
 
 
-# Cache for _ep_is_light_rank: keyed by (ep_rank, n_tok) so we compute once
-# per prefill rather than once per layer.  All 48 MoE layers in one prefill
-# share the same n_tok, so the result is reused until n_tok changes.
-# This avoids repeating topk + GPU-CPU sync (.item()) 48× per prefill.
-_ep_light_cache_key: "tuple[int, int] | None" = None
+# Cache for _ep_is_light_rank: recomputed once per prefill rather than once
+# per layer.  Boundary detection uses the same layer-call-modulo-
+# _FT_MOE_N_LAYERS idiom as _slo_budget_decode_step / _iter_log_step_boundary
+# (this function is only ever invoked from the prefill dispatch-gating path,
+# so every call is a prefill-phase MoE layer call — no decode calls to skip).
+# This avoids repeating topk + GPU-CPU sync (.item()) once per layer per
+# prefill.
+#
+# Previously keyed by (ep_rank, n_tok) instead, invalidating only when n_tok
+# *changed value*. That's wrong: two different, unrelated prefills can share
+# the exact same token count (likely across a sample with lengths clustered
+# in a similar range), in which case the second prefill incorrectly reused
+# the first's stale verdict instead of recomputing from its own (different)
+# router_logits. Found during the 2026-07-08 QPS sweep.
+_ep_light_layer_calls: int = 0
 _ep_light_cache_val: bool = True
+
+# Anti-starvation floor: if this rank is judged heavy this many consecutive
+# prefills in a row, force one light-rank dispatch anyway regardless of the
+# computed verdict. Without this, a rank whose experts genuinely, correctly
+# attract more tokens than the other's for most prefills in a workload (a
+# real routing characteristic, not a caching artifact) gets starved of ALL
+# Arm-C dispatch indefinitely — the mechanism behind both the pure-C collapse
+# and the B+C round-divergence seen in the 2026-07-08 low-QPS sweep on
+# Qwen1.5-MoE-A2.7B.
+#
+# Default of 3, not Arm B's _PROBE_CYCLE=10: 10 was an initial guess by
+# analogy, but measured directly on the 2026-07-08 B+C 0.4qps regression
+# (rank 0 heavy ~90% of prefills), cycle=10 only trimmed rndz timeouts from
+# 28->23 and training_steps from 61->50 -- still worse than pure B's 154.
+# cycle=3 eliminated rndz timeouts entirely (28->0), perfectly balanced
+# per-rank job completions (101/101), and lifted training_steps to 200
+# (above pure B). Re-swept at 0.6/1/2/4 qps with cycle=3: +1% to +7% over
+# the pre-fix B+C numbers at every point, no TPOT regression anywhere --
+# confirmed on 2026-07-10.
+_EP_STARVE_PROBE_CYCLE: int = int(
+    os.environ.get("VLLM_FT_EP_STARVE_PROBE_CYCLE", "3")
+)
+_ep_light_heavy_streak: int = 0
 
 
 def _ep_is_light_rank(
@@ -370,10 +407,16 @@ def _ep_is_light_rank(
     suggest.
 
     Cost: one topk + one GPU→CPU sync (.item()) PER PREFILL, not per layer.
-    All 48 MoE layers in a prefill share the same n_tok, so the result is
-    cached on the first call and reused for the remaining 47 calls.
+    All MoE layers in a prefill share the same n_tok, so the result is
+    cached on the first layer's call and reused for the remaining layers
+    (see _ep_light_layer_calls above for boundary detection).
+
+    Anti-starvation: a heavy verdict this many prefills running
+    (_EP_STARVE_PROBE_CYCLE) is overridden to a forced light dispatch, so a
+    persistently heavy rank still gets bounded, periodic Arm-C dispatch
+    instead of none at all.
     """
-    global _ep_light_cache_key, _ep_light_cache_val
+    global _ep_light_layer_calls, _ep_light_cache_val, _ep_light_heavy_streak
 
     if _COMBINED_TRIGGER_RANK is not None:
         return _sched_get_tp_rank() == _COMBINED_TRIGGER_RANK
@@ -383,12 +426,12 @@ def _ep_is_light_rank(
             runner.moe_config.ep_size <= 1):
         return True
 
-    ep_rank = runner.moe_config.ep_rank
-    cache_key = (ep_rank, n_tok)
-    if cache_key == _ep_light_cache_key:
+    _ep_light_layer_calls += 1
+    if _ep_light_layer_calls % _FT_MOE_N_LAYERS != 1:
         return _ep_light_cache_val   # same prefill — free cache hit
 
-    # n_tok changed → new prefill.  Recompute (one topk + one .item()).
+    # Layer 0 of a new prefill → recompute (one topk + one .item()).
+    ep_rank = runner.moe_config.ep_rank
     n_local = runner.moe_config.num_local_experts
     exp_start = ep_rank * n_local
     top_k = runner.moe_config.experts_per_token
@@ -400,7 +443,23 @@ def _ep_is_light_rank(
         )
 
     result = local_assignments * runner.moe_config.ep_size <= n_tok * top_k
-    _ep_light_cache_key = cache_key
+
+    if result:
+        _ep_light_heavy_streak = 0
+    else:
+        _ep_light_heavy_streak += 1
+        if _ep_light_heavy_streak >= _EP_STARVE_PROBE_CYCLE:
+            # Confirmed firing correctly in the 2026-07-10 re-verification
+            # debug run: rank 0's streak climbed 1..9 then forced here,
+            # never exceeding the _EP_STARVE_PROBE_CYCLE bound.
+            logger.info(
+                "[ep_light] rank=%d anti-starvation: forcing light dispatch "
+                "after %d consecutive heavy prefills",
+                ep_rank, _ep_light_heavy_streak,
+            )
+            result = True
+            _ep_light_heavy_streak = 0
+
     _ep_light_cache_val = result
     return result
 
