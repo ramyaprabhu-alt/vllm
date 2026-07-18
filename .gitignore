@@ -207,6 +207,14 @@ cython_debug/
 # Results
 *.csv
 
+# BubbleTea benchmark output/logs (generated per-run, not source)
+/compare_results/
+/compare_results.bak*/
+/logs/
+/fwd_placement_results/
+/fwd_policy_results/
+/tpot_tft_results/
+
 # Python pickle files
 *.pkl
 
