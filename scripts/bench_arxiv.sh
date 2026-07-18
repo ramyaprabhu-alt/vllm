@@ -104,6 +104,7 @@ fi
 # ── 2. Run benchmark ──────────────────────────────────────────────────────────
 echo
 "$VENV/bin/python" tools/compare_benchmark.py \
+    --model           "$MODEL" \
     --dataset-name    custom \
     --dataset-path    "$ARXIV_FILTERED" \
     --num-prompts     "$NUM_PROMPTS" \

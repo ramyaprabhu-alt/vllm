@@ -6,6 +6,18 @@
 
 set -euo pipefail
 
+# BubbleTea backward-dispatch mode. Default "bubble" gates ALL training
+# dispatch on _ep_is_light_rank() during prefill only (zero dispatch during
+# decode) -- on Qwen1.5-MoE-A2.7B's top-4-of-60 routing the light/heavy rank
+# flips unpredictably prefill-to-prefill (unlike Qwen3-30B-A3B's top-8-of-128,
+# where one rank is consistently light), so a rank can go an entire run
+# without a single backward dispatch. That stalls its _fwd_round forever and
+# _sync_fwd_round() times out against a peer that will never advance --
+# no rndz timeout value fixes that. "both" keeps the prefill-bubble dispatch
+# AND adds unconditional decode-phase dispatch, so every rank always makes
+# progress regardless of which one is "light" this prefill.
+export VLLM_FT_BWD_MODE="${VLLM_FT_BWD_MODE:-both}"
+
 VENV="/mnt/nfs/home/ramya/vllm/.venv"
 export PATH="$VENV/bin:$PATH"
 MODEL="/mnt/nfs/home/ramya/models/Qwen/Qwen1.5-MoE-A2.7B"
@@ -35,6 +47,7 @@ echo "Max context:  $MAX_MODEL_LEN tokens"
 echo "Port:         $PORT"
 if [ -n "${VLLM_FT_LORA_PATH:-}" ]; then
     echo "BubbleTea:    LoRA training from $VLLM_FT_LORA_PATH"
+    echo "BWD mode:     $VLLM_FT_BWD_MODE"
 fi
 echo ""
 

@@ -184,11 +184,42 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        # C+D_batch: inject FT tokens into this MoE call so expert weights are
+        # read once for both inference and FT tokens (same pattern as
+        # Qwen3MoeSparseMoeBlock.forward()).
+        ft_h: torch.Tensor | None = None
+        try:
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+                ft_moe_advance, ft_moe_get_hidden, ft_moe_get_hidden_event,
+                ft_moe_get_window,
+            )
+            ft_h = ft_moe_get_hidden(window=ft_moe_get_window())
+            if ft_h is not None:
+                # In real-training C+D_batch mode the hidden state was written
+                # on bwd_stream by the attention sub-op. Wait for that event
+                # before reading -- expected wait ~= 0ms since training
+                # attention (128 tokens) completes within the inter-layer gap.
+                ft_evt = ft_moe_get_hidden_event()
+                if ft_evt is not None:
+                    torch.cuda.current_stream().wait_event(ft_evt)
+        except ImportError:
+            ft_h = None
+
+        if ft_h is not None:
+            n_inf = hidden_states.shape[0]
+            combined = torch.cat([hidden_states, ft_h], dim=0)
+            router_logits, _ = self.gate(combined)
+            combined_out = self.experts(
+                hidden_states=combined, router_logits=router_logits
+            )
+            final_hidden_states = combined_out[:n_inf]
+            ft_moe_advance(combined_out[n_inf:])
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
 
         return final_hidden_states.view(orig_shape)
 
@@ -645,7 +676,7 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             import torch as _torch
 
             from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
-                register_bt_trainer,
+                register_bt_trainer, combined_t_ft,
             )
 
             _root = str(pathlib.Path(__file__).parents[3])  # → /mnt/nfs/home/ramya/vllm
@@ -660,7 +691,7 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             cache_dir = os.environ.get(
                 "VLLM_FT_CACHE_DIR", "/mnt/nfs/home/ramya/scratch"
             )
-            t_ft = int(os.environ.get("VLLM_FT_COMBINED_T_FT", "128"))
+            t_ft = combined_t_ft()
             accum_steps = int(os.environ.get("VLLM_FT_ACCUM_STEPS", "4"))
             device = _torch.cuda.current_device()
 

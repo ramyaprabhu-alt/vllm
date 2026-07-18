@@ -682,8 +682,13 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
     if args.ft:
         env["VLLM_FT_COMBINED_MODE"] = args.ft_mode
         # Enable real LoRA training: trainer initialises inside the worker at
-        # model-load time (see qwen3_moe.py:_maybe_init_bt_trainer).
-        env["VLLM_FT_LORA_PATH"] = BT_LORA_ADAPTER
+        # model-load time (see qwen3_moe.py:_maybe_init_bt_trainer). Respect an
+        # already-set VLLM_FT_LORA_PATH (e.g. bench_arxiv.sh's LORA= override
+        # for a non-Qwen3 model) instead of unconditionally forcing the Qwen3
+        # toy adapter -- silently loading the wrong-shaped adapter here caused
+        # every Qwen1.5-MoE-A2.7B benchmark to crash on the first LoRA forward
+        # (q_proj.lora_B loaded as Qwen3's [4096,16] instead of [2048,16]).
+        env["VLLM_FT_LORA_PATH"] = os.environ.get("VLLM_FT_LORA_PATH", BT_LORA_ADAPTER)
         env["VLLM_FT_TOKENIZER_PATH"] = MODEL_DIR
         env["VLLM_FT_CACHE_DIR"] = "/mnt/nfs/home/ramya/scratch"
         env["VLLM_FT_COMBINED_T_FT"] = str(args.t_ft)
@@ -971,6 +976,7 @@ def print_comparison(results: dict) -> None:
 
 
 def main() -> None:
+    global MODEL_DIR
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -982,6 +988,11 @@ def main() -> None:
             "Comma-separated list of systems to run, or 'all'. "
             "Choices: vllm, llmstation, bubble_tea  (default: all)"
         ),
+    )
+    parser.add_argument(
+        "--model",
+        default=MODEL_DIR,
+        help=f"Path to the base model to serve (default: {MODEL_DIR})",
     )
     parser.add_argument(
         "--request-rate",
@@ -1117,6 +1128,7 @@ def main() -> None:
         "Use --no-ft for inference-only baseline.",
     )
     args = parser.parse_args()
+    MODEL_DIR = args.model
 
     # Validate
     if args.trace_file is not None:

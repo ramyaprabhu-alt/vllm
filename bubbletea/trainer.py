@@ -45,6 +45,21 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# ── Opt-in debug logging (VLLM_FT_DEBUG=1) ──────────────────────────────────
+# Nothing configures this logger's level by default, so the log.debug(...)
+# calls throughout this module — including the per-op backward exception
+# handlers (e.g. bwd_o_lora_i's `except Exception: log.debug(...);
+# bwd_state["ok"] = False`) and _optimizer_op's skip-reason — are silently
+# dropped. Set VLLM_FT_DEBUG=1 to surface them in the server's stdout/stderr
+# capture instead of inferring failures from timeout math.
+if os.environ.get("VLLM_FT_DEBUG", "0") == "1":
+    log.setLevel(logging.DEBUG)
+    if not any(isinstance(h, logging.StreamHandler) for h in log.handlers):
+        _dbg_handler = logging.StreamHandler()
+        _dbg_handler.setFormatter(logging.Formatter("[BT-DEBUG] %(message)s"))
+        log.addHandler(_dbg_handler)
+    log.propagate = False
+
 # ── RMSNorm helpers (manual, no autograd) ────────────────────────────────────
 #
 # Both helpers scale x by 1/amax before squaring to prevent float32 overflow
@@ -76,12 +91,14 @@ def _rms_norm_bwd_x(
     return dx.to(x.dtype)
 
 
-# ── Constants (Qwen3-30B-A3B architecture) ─────────────────────────────────
-_HIDDEN = 2048
+# ── Constants ────────────────────────────────────────────────────────────
+# Fallback defaults only, used via getattr() when the real attention module
+# doesn't expose the corresponding attribute; the live values (read from
+# inner.layers[0].self_attn in __init__) always take precedence. Originally
+# Qwen3-30B-A3B's values.
 _N_HEADS = 32
 _N_KV = 4
 _HEAD_DIM = 128
-_N_LAYERS = 48
 _LORA_ALPHA = 16
 
 # Set VLLM_FT_SYNC_LORA_PARAMS=1 to broadcast replicated LoRA params from the
@@ -109,6 +126,16 @@ _TP_CORRECT: bool = os.environ.get("VLLM_FT_TP_CORRECT", "0") == "1"
 # observed cross-rank skew.
 _TP_CORRECT_TIMEOUT_MS: int = int(
     os.environ.get("VLLM_FT_TP_CORRECT_TIMEOUT_MS", "500")
+)
+
+# Timeout (s) for _sync_fwd_round's per-round rendezvous (see that method).
+# Default of 2s was tuned against Qwen3-30B-A3B (48 layers); smaller/faster
+# models complete far more forward rounds per wall-clock second, so the same
+# absolute round-count skew between TP ranks eats a much bigger fraction of a
+# fixed time budget. Bump via VLLM_FT_RNDZ_TIMEOUT_MS for such models instead
+# of hardcoding a new default here.
+_RNDZ_TIMEOUT_S: float = (
+    int(os.environ.get("VLLM_FT_RNDZ_TIMEOUT_MS", "2000")) / 1000.0
 )
 
 # Wire format for _tp_correct_exchange_sum's per-round header: a single
@@ -363,6 +390,7 @@ class BubbleTeaLoRATrainer:
         self._n_kv_local = getattr(
             _first_attn, "num_kv_heads", max(1, _N_KV // self._tp_size)
         )
+        self._head_dim = getattr(_first_attn, "head_dim", _HEAD_DIM)
 
         # ── LoRA parameters ───────────────────────────────────────────────
         self._lora: dict[int, dict[str, torch.Tensor]] = {}  # layer -> proj -> tensor
@@ -1025,25 +1053,28 @@ class BubbleTeaLoRATrainer:
     # ── Forward-round rendezvous ─────────────────────────────────────────────
 
     def _sync_fwd_round(self) -> bool:
-        """Rendezvous both TP ranks to the same _fwd_round before training.
+        """Rendezvous every TP rank to the same _fwd_round before training.
 
-        The two TP workers advance _fwd_round independently: whichever rank
-        sees lighter expert traffic finishes each training cycle faster and
-        pulls ahead.  When they diverge the TP-correct exchange keys don't
+        The TP workers advance _fwd_round independently: whichever rank(s)
+        see lighter expert traffic finish each training cycle faster and
+        pull ahead.  When they diverge the TP-correct exchange keys don't
         match and every TCPStore collect times out, silently setting
         bwd_state["ok"]=False and blocking the optimizer step.
 
-        Both ranks publish their current round to "bt_rndz/{rank}" and poll
-        until the peer has caught up.  The lagging rank jumps to the faster
-        rank's value so they converge in one iteration.  Gracefully falls back
-        (returns True) when TP-correct is disabled or the store is unavailable.
+        Every rank publishes its current round to "bt_rndz/{rank}" and polls
+        the other tp_size-1 ranks until all agree.  A rank that's behind the
+        group's furthest-ahead round jumps straight to it (so they converge
+        in one iteration regardless of tp_size); a rank that's ahead just
+        waits for the stragglers, who will jump to it on their next poll.
+        Gracefully falls back (returns True) when TP-correct is disabled or
+        the store is unavailable.
 
-        Returns True when both ranks are on the same round, False on timeout.
+        Returns True when every rank is on the same round, False on timeout.
         Caller must release _fwd_running and set _fwd_layer_state=None on False.
         """
         if not (
             self._tp_correct
-            and self._tp_size == 2
+            and self._tp_size > 1
             and self._tp_correct_store is not None
         ):
             return True
@@ -1052,7 +1083,9 @@ class BubbleTeaLoRATrainer:
         from datetime import timedelta as _td
 
         my_key = f"bt_rndz/{self._tp_rank}"
-        peer_key = f"bt_rndz/{1 - self._tp_rank}"
+        peer_keys = [
+            f"bt_rndz/{r}" for r in range(self._tp_size) if r != self._tp_rank
+        ]
 
         try:
             self._tp_correct_store.set(my_key, str(self._fwd_round).encode())
@@ -1060,40 +1093,45 @@ class BubbleTeaLoRATrainer:
             log.debug("[BubbleTea] rndz publish failed: %s", _e)
             return True  # store unavailable; proceed unsynchronised
 
-        deadline = _t.time() + 2.0
+        deadline = _t.time() + _RNDZ_TIMEOUT_S
         while _t.time() < deadline:
             try:
-                # wait() returns immediately after the first round (key exists).
-                self._tp_correct_store.wait([peer_key], _td(milliseconds=50))
-                peer_round = int(self._tp_correct_store.get(peer_key))
+                # wait() returns immediately once every peer key already exists.
+                self._tp_correct_store.wait(peer_keys, _td(milliseconds=50))
+                peer_rounds = [
+                    int(self._tp_correct_store.get(k)) for k in peer_keys
+                ]
             except Exception:
                 _t.sleep(0.005)
                 continue
 
-            if peer_round == self._fwd_round:
-                return True
-
-            if peer_round > self._fwd_round:
-                # Jump to the faster rank's round and republish.
-                self._fwd_round = peer_round
+            max_peer_round = max(peer_rounds, default=self._fwd_round)
+            if max_peer_round > self._fwd_round:
+                # Jump to the furthest-ahead rank's round and republish.
+                self._fwd_round = max_peer_round
                 try:
                     self._tp_correct_store.set(my_key, str(self._fwd_round).encode())
                 except Exception:
                     return True
-                continue  # immediately re-check; peer may already be satisfied
+                continue  # immediately re-check; peers may already be satisfied
 
-            # Peer is behind; it will jump to our round on its next poll.
+            if all(r == self._fwd_round for r in peer_rounds):
+                return True
+
+            # Some peer(s) still behind; they'll jump to our round on their
+            # next poll.
             _t.sleep(0.005)
 
         import warnings as _w
 
         _w.warn(
-            f"[BubbleTea LoRA] rndz timed out after 2s"
+            f"[BubbleTea LoRA] rndz timed out after {_RNDZ_TIMEOUT_S:.1f}s"
             f" (rank={self._tp_rank} round={self._fwd_round})",
             stacklevel=1,
         )
         log.debug(
-            "[BubbleTea] rndz timed out after 2s (rank=%d round=%d)",
+            "[BubbleTea] rndz timed out after %.1fs (rank=%d round=%d)",
+            _RNDZ_TIMEOUT_S,
             self._tp_rank,
             self._fwd_round,
         )
@@ -1351,8 +1389,8 @@ class BubbleTeaLoRATrainer:
         dtype = x2.dtype
 
         # ── Routing (frozen) — same as _training_moe_forward ──────────────
-        gate_w = layer_mlp.gate.weight.detach()  # [128, H]
-        router_logits = x2 @ gate_w.T  # [T, 128]
+        gate_w = layer_mlp.gate.weight.detach()  # [n_experts, H]
+        router_logits = x2 @ gate_w.T  # [T, n_experts]
         scores = torch.softmax(router_logits.float(), dim=-1).to(dtype)
         topk_scores, topk_ids = torch.topk(
             scores, layer_mlp.experts.top_k, dim=-1
@@ -1524,7 +1562,7 @@ class BubbleTeaLoRATrainer:
         T = x.shape[0]
         nh = self._n_heads_local
         nkv = self._n_kv_local
-        hd = _HEAD_DIM
+        hd = self._head_dim
         scaling = _LORA_ALPHA / 16  # lora_alpha / lora_rank = 1.0
 
         # ── Retrieve base QKV weights (detached) ─────────────────────────
@@ -1698,8 +1736,8 @@ class BubbleTeaLoRATrainer:
         dev, dtype = hidden.device, hidden.dtype
 
         # Gate weight is replicated on all ranks — same routing on every GPU
-        gate_w = layer_mlp.gate.weight.detach()  # [128, H]
-        router_logits = hidden.detach() @ gate_w.T  # [T, 128]
+        gate_w = layer_mlp.gate.weight.detach()  # [n_experts, H]
+        router_logits = hidden.detach() @ gate_w.T  # [T, n_experts]
         scores = torch.softmax(router_logits.float(), dim=-1).to(dtype)
         topk_scores, topk_ids = torch.topk(
             scores, layer_mlp.experts.top_k, dim=-1
@@ -1707,8 +1745,8 @@ class BubbleTeaLoRATrainer:
         # norm_topk_prob=True: renormalise selected scores
         topk_scores = topk_scores / (topk_scores.sum(-1, keepdim=True) + 1e-9)
 
-        w13 = layer_mlp.experts.w13_weight.detach()  # [E_local, 2*768, H]
-        w2 = layer_mlp.experts.w2_weight.detach()  # [E_local, H, 768]
+        w13 = layer_mlp.experts.w13_weight.detach()  # [E_local, 2*d_inter, H]
+        w2 = layer_mlp.experts.w2_weight.detach()  # [E_local, H, d_inter]
         d_inter = w2.shape[2]
         output = torch.zeros(T, H, device=dev, dtype=dtype)
 
@@ -1779,8 +1817,8 @@ class BubbleTeaLoRATrainer:
                 attn = layer.self_attn
 
                 # qkv_proj.weight layout per rank: [q_local + k_local + v_local, H]
-                q_sz = self._n_heads_local * _HEAD_DIM
-                kv_sz = self._n_kv_local * _HEAD_DIM
+                q_sz = self._n_heads_local * self._head_dim
+                kv_sz = self._n_kv_local * self._head_dim
 
                 for proj_ab, param in proj_dict.items():
                     proj, ab = proj_ab.rsplit(".", 1)  # e.g. "q_proj", "lora_A"
@@ -1846,6 +1884,13 @@ class BubbleTeaLoRATrainer:
         def _fwd_init():
             # ── Guards (no lock held yet) ──────────────────────────────────
             import time as _t
+
+            trainer._fwd_init_calls = getattr(trainer, "_fwd_init_calls", 0) + 1
+            log.debug(
+                "[BubbleTea] fwd_init: ENTRY call #%d (rank=%d)",
+                trainer._fwd_init_calls,
+                trainer._tp_rank,
+            )
 
             # Start data thread on first call.
             if not trainer._data_thread_started:
@@ -2107,7 +2152,12 @@ class BubbleTeaLoRATrainer:
                         trainer._fwd_layer_state = None
                         trainer._fwd_running.release()
                 except Exception as exc:
-                    log.debug("[BubbleTea LoRA] fwd_layer_%d error: %s", i, exc)
+                    import traceback as _tb
+
+                    log.warning(
+                        "[BubbleTea LoRA] fwd_layer_%d error: %s\n%s",
+                        i, exc, _tb.format_exc(),
+                    )
                     state["ok"] = False
                     if is_last:
                         trainer._fwd_running.release()
@@ -2151,6 +2201,15 @@ class BubbleTeaLoRATrainer:
             # Run the standard init first (populates _fwd_layer_state).
             # We call _fwd_init by re-using build_fwd_subops' init logic inline.
             import time as _t
+
+            trainer._fwd_init_cdbatch_calls = (
+                getattr(trainer, "_fwd_init_cdbatch_calls", 0) + 1
+            )
+            log.debug(
+                "[BubbleTea] fwd_init_cdbatch: ENTRY call #%d (rank=%d)",
+                trainer._fwd_init_cdbatch_calls,
+                trainer._tp_rank,
+            )
 
             from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
                 ft_moe_reset_moe_delta,
@@ -2754,7 +2813,7 @@ class BubbleTeaLoRATrainer:
                     T = x_norm.shape[0]
                     nh = trainer._n_heads_local
                     nkv = trainer._n_kv_local
-                    hd = _HEAD_DIM
+                    hd = trainer._head_dim
                     q_sz = nh * hd
                     kv_sz = nkv * hd
 
@@ -2840,7 +2899,7 @@ class BubbleTeaLoRATrainer:
                     T = fwd_i["x_norm"].shape[0]
                     nh = trainer._n_heads_local
                     nkv = trainer._n_kv_local
-                    hd = _HEAD_DIM
+                    hd = trainer._head_dim
                     q_sz = nh * hd
                     positions = bwd_state["positions"]
 
@@ -2919,7 +2978,7 @@ class BubbleTeaLoRATrainer:
                     T = x_norm.shape[0]
                     nh = trainer._n_heads_local
                     nkv = trainer._n_kv_local
-                    hd = _HEAD_DIM
+                    hd = trainer._head_dim
                     q_sz = nh * hd
                     kv_sz = nkv * hd
 

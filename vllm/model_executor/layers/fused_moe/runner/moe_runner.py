@@ -118,9 +118,23 @@ import threading as _threading
 _bt_subop_running = _threading.local()
 
 def register_bt_trainer(trainer) -> None:
-    """Called from qwen3_moe.py after model load when VLLM_FT_LORA_PATH is set."""
-    global _bt_trainer
+    """Called from qwen3_moe.py/qwen2_moe.py after model load when
+    VLLM_FT_LORA_PATH is set.
+
+    Also derives _FT_MOE_N_LAYERS / _BUBBLE_LAYERS_PER_PREFILL from the real
+    model's layer count, since both default to "48" (Qwen3-30B-A3B's layer
+    count) and silently misdetect iteration/prefill boundaries on any other
+    model -- e.g. Qwen1.5-MoE-A2.7B's 24 layers would only trip the modulo
+    check every 2 real passes. An explicit VLLM_FT_MOE_N_LAYERS /
+    VLLM_BUBBLE_N_LAYERS env var still wins, for manual overrides/testing.
+    """
+    global _bt_trainer, _FT_MOE_N_LAYERS, _BUBBLE_LAYERS_PER_PREFILL
     _bt_trainer = trainer
+    n_layers = len(trainer._layers)
+    if "VLLM_FT_MOE_N_LAYERS" not in os.environ:
+        _FT_MOE_N_LAYERS = n_layers
+    if "VLLM_BUBBLE_N_LAYERS" not in os.environ:
+        _BUBBLE_LAYERS_PER_PREFILL = n_layers
 
 _combined_mode: str = os.environ.get("VLLM_FT_COMBINED_MODE", "off")
 if _combined_mode == "B+D":
@@ -135,6 +149,22 @@ elif _combined_mode == "D+D":
 elif _combined_mode == "C+D_batch":
     _fwd_mode = "decode"
 
+
+def combined_t_ft() -> int:
+    """FT tokens the trainer produces per round.
+
+    VLLM_FT_COMBINED_T_FT (default 128) for every combined mode except
+    C+D_dynamic, which uses VLLM_FT_COMBINED_T_FT_MAX (default 512) instead:
+    the trainer always produces this many tokens per round, but C+D_dynamic
+    fuses only a per-step SLO-solved prefix of them into each MoE-FFN call
+    (see ft_moe_get_window()), so it needs more headroom than the fixed-128
+    default to let the solved window actually vary.
+    """
+    if _combined_mode == "C+D_dynamic":
+        return int(os.environ.get("VLLM_FT_COMBINED_T_FT_MAX", "512"))
+    return int(os.environ.get("VLLM_FT_COMBINED_T_FT", "128"))
+
+
 # ── FT MoE batch state ────────────────────────────────────────────────────────
 # When C+D_batch is active, the MoE forward for FT tokens is injected directly
 # into each Qwen3MoeSparseMoeBlock.forward() call instead of running on a
@@ -147,7 +177,7 @@ _ft_moe_state: dict = {
     "hidden_event": None,   # CUDA Event: fires when "hidden" was last written on bwd_stream
                             # (C+D_batch real mode only; None = hidden is ready immediately)
     "layer_count":  0,      # number of MoE layers processed so far this pass
-    "t_ft":         int(os.environ.get("VLLM_FT_COMBINED_T_FT", "128")),
+    "t_ft":         combined_t_ft(),
     "pass_count":   0,      # completed FT passes (for throughput tracking)
     "real_training": False, # True when C+D_batch is using real trainer fwd sub-ops
     "moe_delta":       None, # torch.Tensor [T_ft, H] — most recently completed
@@ -198,11 +228,36 @@ def ft_moe_set_hidden(hidden: "torch.Tensor", event: "torch.cuda.Event | None") 
     _ft_moe_state["hidden_event"] = event
 
 
-def ft_moe_get_hidden() -> "torch.Tensor | None":
-    """Return current FT hidden state (or None if not active)."""
+def ft_moe_get_hidden(window: "int | None" = None) -> "torch.Tensor | None":
+    """Return current FT hidden state (or None if not active).
+
+    window, if given (C+D_dynamic only, via ft_moe_get_window()), slices the
+    returned tensor to its first `window` rows -- the SLO-solved fusion size
+    for this step. window=0 returns an empty [0, H] tensor (not None), so a
+    step that solves s=0 still fuses zero tokens through the ordinary
+    torch.cat/advance path rather than needing a special case.
+    """
     if not _ft_moe_state["active"]:
         return None
-    return _ft_moe_state["hidden"]
+    h = _ft_moe_state["hidden"]
+    if window is None or window >= h.shape[0]:
+        return h
+    return h[:window]
+
+
+_window_cache_val: int = 0  # s for the step currently in progress
+
+
+def ft_moe_get_window() -> "int | None":
+    """Current step's SLO-solved FT-token fusion window (C+D_dynamic only).
+
+    Returns None for every other combined mode, meaning "no window slicing
+    -- use the full hidden state," i.e. ft_moe_get_hidden()'s original
+    fixed-t_ft behavior (C+D_batch and friends).
+    """
+    if _combined_mode != "C+D_dynamic":
+        return None
+    return _window_cache_val
 
 
 def ft_moe_get_hidden_event() -> "torch.cuda.Event | None":
@@ -792,6 +847,15 @@ def _submit_combined_dd_job() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _BUBBLE_MIN_TOKENS = 100
+# Number of MoE layers per prefill, used only to detect "last layer of this
+# prefill → safe to synchronize and flush" below. Defaults to 48
+# (Qwen3-30B-A3B) here only as a pre-trainer-registration fallback; on a model
+# with a different layer count the modulo would otherwise never hit 0 again
+# after layer 0, so _bubble_pending would silently never flush.
+# register_bt_trainer() overwrites this from the real model's layer count once
+# VLLM_FT_LORA_PATH is set (unless VLLM_BUBBLE_N_LAYERS is explicitly set, e.g.
+# for standalone VLLM_BUBBLE_PROFILE=1 runs with no trainer registered).
+_BUBBLE_LAYERS_PER_PREFILL = int(os.environ.get("VLLM_BUBBLE_N_LAYERS", "48"))
 
 def _bubble_out_path() -> str:
     try:
@@ -1729,7 +1793,7 @@ class MoERunner(MoERunnerInterface):
                     "t_entry":    _bubble_entry_t,
                     "t_exit":     t_exit_approx,
                 })
-                if layer_idx % 48 == 0:
+                if layer_idx % _BUBBLE_LAYERS_PER_PREFILL == 0:
                     _bubble_calls = 0
                     # Single synchronize + resolve for the whole prefill.
                     torch.cuda.synchronize()
