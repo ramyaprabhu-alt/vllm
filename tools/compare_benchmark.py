@@ -55,6 +55,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -130,6 +131,7 @@ def _warmup_server(
     optimizer step completes (visible in BT_COMPLETIONS) so the benchmark measures
     steady-state, not training start-up latency.
     """
+    import concurrent.futures as _cf
     import json as _json
     import urllib.error
     import urllib.request
@@ -160,29 +162,146 @@ def _warmup_server(
     log(f"  Warmup done ({n_ok}/20 requests succeeded).")
 
     if wait_for_training and env.get("VLLM_FT_LORA_PATH", ""):
-        log("  Waiting for first BubbleTea optimizer step (up to 120s)...")
-        deadline = time.time() + 120
+        # Root cause of the old 120s/300s timeouts, and of sending more of
+        # the SAME short request during the wait, and of switching to a long
+        # prompt sent one-at-a-time: bubble-gated training sub-ops need (a) a
+        # prefill batch with n_tok >= 512 (moe_runner.py's _sched_min_tokens
+        # -- the ~12-token short prompt never clears this) AND (b) genuine
+        # request concurrency. Checked every real run in this project's
+        # history, including the slowest ever run (0.4qps,
+        # qwen15moe_arxiv_200_0.4qps_bubble_cycle3_0710): its first training
+        # step fired at "Running: 3 reqs", never at "Running: 1" -- Poisson
+        # arrivals mean even nominally slow traffic still overlaps sometimes,
+        # which strictly sequential one-at-a-time polling (every earlier
+        # attempt here) never does. Fix: fire several long-prompt requests
+        # CONCURRENTLY per cycle (not one blocking call at a time) so the
+        # server actually sees overlapping in-flight requests during the
+        # wait, matching every real run's condition instead of an
+        # artificially serialized one.
+        long_prompt = (
+            "Briefly summarise recent advances in large language models. " * 120
+        )
+        long_payload = _json.dumps(
+            {
+                "model": MODEL_DIR,
+                "prompt": long_prompt,
+                "max_tokens": 1,
+                "temperature": 0.0,
+            }
+        ).encode()
+        concurrency = 4
+
+        def _fire_one() -> None:
+            try:
+                req = urllib.request.Request(
+                    f"http://localhost:{port}/v1/completions",
+                    data=long_payload,
+                    headers=headers,
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=60)
+            except Exception:
+                pass
+
+        # 30s, not 300s: 2026-07-16 established across 6 back-to-back trials
+        # (idle wait, sequential short/long-prompt polling, 4-way concurrent
+        # polling) that no synthetic warmup traffic tried so far ever
+        # triggers the first optimizer step -- training only ever started
+        # once the real benchmark's own (varied-content) traffic began. A
+        # long wait here just burns GPU time with no observed benefit; kept
+        # short rather than removed in case a future warmup scheme does work.
+        training_wait_s = 30
+        log(
+            f"  Waiting for first BubbleTea optimizer step (up to "
+            f"{training_wait_s}s, polling with {concurrency} concurrent "
+            "long-prompt requests per cycle so the server sees overlapping "
+            "in-flight requests, not one at a time)..."
+        )
+        deadline = time.time() + training_wait_s
         prev = BT_COMPLETIONS.stat().st_size if BT_COMPLETIONS.exists() else -1
-        while time.time() < deadline:
-            if BT_COMPLETIONS.exists():
-                sz = BT_COMPLETIONS.stat().st_size
-                if sz > prev:
-                    log("  Training started — first optimizer step logged.")
-                    break
-            time.sleep(2)
-        else:
-            log("  WARNING: training did not start within 120s — check server log.")
+        with _cf.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            while time.time() < deadline:
+                if BT_COMPLETIONS.exists():
+                    sz = BT_COMPLETIONS.stat().st_size
+                    if sz > prev:
+                        log("  Training started — first optimizer step logged.")
+                        break
+                futures = [pool.submit(_fire_one) for _ in range(concurrency)]
+                _cf.wait(futures, timeout=60)
+            else:
+                log(
+                    f"  WARNING: training did not start within "
+                    f"{training_wait_s}s — check server log."
+                )
+
+
+def _port_is_free(port: int) -> bool:
+    """Check whether *port* is free to bind, without depending on lsof/ss
+    (neither is installed on this host — a prior lsof-based check here
+    silently no-op'd via a broad `except Exception`, masking real port
+    contention and causing the LLMStation "Address already in use" race).
+
+    A plain `connect()` probe is NOT enough: a socket left in TIME_WAIT after
+    the previous server closes its listener refuses new connections (so a
+    connect-based probe reports "free") but still blocks a fresh `bind()` on
+    that port for up to ~60s. Scan /proc/net/tcp{,6} directly instead — any
+    entry for the port (LISTEN, TIME_WAIT, whatever) means bind() can fail.
+    """
+    target = f"{port:04X}"
+    for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(proc_net).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 1 and fields[1].rsplit(":", 1)[-1].upper() == target:
+                return False
+    return True
+
+
+def _pids_on_port(port: int) -> list[int]:
+    """Return PIDs holding an open socket on *port*, parsed from /proc — a
+    dependency-free stand-in for `lsof -ti :port`."""
+    target = f"{port:04X}"
+    inodes: set[str] = set()
+    for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(proc_net).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10:
+                continue
+            if fields[1].rsplit(":", 1)[-1].upper() == target:
+                inodes.add(fields[9])
+    if not inodes:
+        return []
+    pids = []
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            fds = list((pid_dir / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link.startswith("socket:[") and link[8:-1] in inodes:
+                pids.append(int(pid_dir.name))
+                break
+    return pids
 
 
 def _kill_server(port: int, log) -> None:
     log(f"  Stopping server on port {port}...")
-    try:
-        out = subprocess.check_output(["lsof", "-ti", f":{port}"], text=True).strip()
-        for pid in out.splitlines():
-            with contextlib.suppress(Exception):
-                os.kill(int(pid), signal.SIGTERM)
-    except Exception:
-        pass
+    for pid in _pids_on_port(port):
+        with contextlib.suppress(Exception):
+            os.kill(pid, signal.SIGTERM)
     time.sleep(6)
     # Kill worker processes via cmdline patterns and via comm name.
     # Workers rename themselves (prctl PR_SET_NAME) to "VLLM::Worker_TP*".
@@ -222,25 +341,21 @@ def _kill_server(port: int, log) -> None:
         time.sleep(5)
     else:
         log("  WARNING: GPU memory may not be fully freed — proceeding anyway.")
-    # Wait for port to be released (vLLM v1 multi-process servers can hold
-    # the socket briefly after GPU memory is freed).
-    deadline = time.time() + 30
+    # Wait for port to be released. A closed listening socket can sit in
+    # TIME_WAIT for up to ~60s (2*MSL) during which nothing owns it (so
+    # SIGKILL has nothing to target) but a fresh bind() still fails — so the
+    # budget here must exceed that, not just cover process-teardown lag.
+    deadline = time.time() + 75
     while time.time() < deadline:
-        try:
-            out = subprocess.check_output(
-                ["lsof", "-ti", f":{port}"], text=True
-            ).strip()
-            if not out:
-                break
-            # Still held — force-kill anything remaining
-            for pid in out.splitlines():
-                with contextlib.suppress(Exception):
-                    os.kill(int(pid), signal.SIGKILL)
-        except subprocess.CalledProcessError:
-            break  # lsof returns non-zero when nothing is found = port free
-        except Exception:
+        if _port_is_free(port):
             break
-        time.sleep(1)
+        # If something still owns the socket (not just TIME_WAIT), force-kill it.
+        for pid in _pids_on_port(port):
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGKILL)
+        time.sleep(2)
+    else:
+        log(f"  WARNING: port {port} may still be in TIME_WAIT — proceeding anyway.")
     time.sleep(2)  # brief grace period for OS to fully release the socket
 
 
@@ -520,6 +635,13 @@ def run_llmstation(args, result_dir: Path, log) -> dict:
 
     # LMS env
     env = os.environ.copy()
+    # Override the expandable_segments allocator config inherited from the
+    # caller's shell (bench_arxiv.sh exports it for the BubbleTea/vLLM CUDA13
+    # build). LLMStation's older multiproc_gpu_executor shares tensors across
+    # TP worker processes via CUDA IPC, which PyTorch refuses to do for
+    # expandable-segment allocations ("Tensors allocated with
+    # expandable_segments:True cannot be shared between processes").
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
     env["PATH"] = f"{LMS_VENV}/bin:{env.get('PATH', '')}"
     env["LD_LIBRARY_PATH"] = f"{LMS_PYTORCH_LIB}:{env.get('LD_LIBRARY_PATH', '')}"
     env["VLLM_NCCL_SO_PATH"] = LMS_NCCL_SO
@@ -527,7 +649,14 @@ def run_llmstation(args, result_dir: Path, log) -> dict:
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
     env["CUDA_MPS_PIPE_DIRECTORY"] = str(mps_dir)
     env["CUDA_MPS_LOG_DIRECTORY"] = str(mps_log)
-    env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(args.lms_mps_percent)
+    # Do NOT set CUDA_MPS_ACTIVE_THREAD_PERCENTAGE here: per vllm's own
+    # arg_utils.py ("...for training workers only"), this cap is meant to
+    # apply solely to the LMS finetune subprocess, which sets it on its own
+    # os.environ from the --lms-mps-percent CLI flag (already passed below)
+    # right before that subprocess initializes CUDA. Setting it in the
+    # top-level env here instead leaked the cap onto the *inference* engine
+    # and TP workers too — with --lms-mps-percent 20 that meant inference
+    # itself was starved to 20% of the GPU's SMs (observed: ~129s mean TTFT).
 
     # Start MPS — quit any stale daemon first so a leftover instance from a
     # prior failed run doesn't cause "already running" on the new start.
@@ -570,6 +699,15 @@ def run_llmstation(args, result_dir: Path, log) -> dict:
             "4",
             "--max-lora-rank=8",
             "--enable-lms",
+            # LLMStation's finetune() loads yahma/alpaca-cleaned via
+            # datasets.load_dataset(cache_dir=self.load_config.download_dir).
+            # download_dir defaults to None, i.e. ~/.cache/huggingface, which
+            # doesn't have this dataset cached — and HF_DATASETS_OFFLINE/
+            # TRANSFORMERS_OFFLINE inherited from bench_arxiv.sh's shell env
+            # then block it from fetching it, so the finetune worker crashes
+            # at startup (0 training steps, no error surfaced to the caller).
+            # Point it at the same shared cache BubbleTea already populated.
+            "--download-dir=/mnt/nfs/home/ramya/scratch",
             f"--lms-output={result_dir.resolve()}",
             f"--lms-forward-tasklets={args.lms_fwd_tasklets}",
             f"--lms-forward-wait={args.lms_fwd_wait}",
@@ -597,7 +735,18 @@ def run_llmstation(args, result_dir: Path, log) -> dict:
     if not _wait_server(PORT):
         log("  ERROR: server did not become ready in time.")
         server_proc.terminate()
+        # Full teardown (not just terminate()) — a timed-out LMS server can
+        # still hold the port/GPU memory, which previously caused the next
+        # system in the sweep to hit "Address already in use" on bind.
+        _kill_server(PORT, log)
+        subprocess.run(
+            ["sh", "-c", "echo quit | nvidia-cuda-mps-control"],
+            env=env,
+            capture_output=True,
+        )
         return {"error": "server timeout"}
+
+    _warmup_server(PORT, env, args, log, wait_for_training=False)
 
     start_line = sum(1 for _ in open(lms_log)) if lms_log.exists() else 0  # noqa: SIM115
 
@@ -675,7 +824,7 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
 
     env = os.environ.copy()
     env["PATH"] = f"{BT_VENV}/bin:{env.get('PATH', '')}"
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(args.tp_size))
     # .venv-bubble ships CUDA 13 runtime; make it available to the worker processes.
     _cu13_lib = f"{BT_VENV}/lib/python3.12/site-packages/nvidia/cu13/lib"
     env["LD_LIBRARY_PATH"] = f"{_cu13_lib}:{env.get('LD_LIBRARY_PATH', '')}"
@@ -692,6 +841,10 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         env["VLLM_FT_TOKENIZER_PATH"] = MODEL_DIR
         env["VLLM_FT_CACHE_DIR"] = "/mnt/nfs/home/ramya/scratch"
         env["VLLM_FT_COMBINED_T_FT"] = str(args.t_ft)
+        if args.ft_mode == "C+D_dynamic":
+            env["VLLM_FT_COMBINED_T_FT_MAX"] = str(args.t_ft_max)
+            env["VLLM_FT_WINDOW_OVERHEAD_FRAC"] = str(args.window_overhead_frac)
+            env["VLLM_FT_WINDOW_PROBE_CYCLE"] = str(args.window_probe_cycle)
         if args.trigger_rank is not None:
             env["VLLM_FT_COMBINED_TRIGGER_RANK"] = str(args.trigger_rank)
         # Prevent bt_lora_trainer from contacting the HF hub for dataset
@@ -702,6 +855,9 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         env["TRANSFORMERS_OFFLINE"] = "1"  # transformers: no hub check on tokenizer
         env["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
         env["VLLM_FT_SCHED_MODE"] = args.sched_mode
+        env["VLLM_FT_BWD_MODE"] = args.bwd_mode
+        if args.bwd_mode in ("slo_budget", "slo_budget_both"):
+            env["VLLM_FT_SLOD_MS"] = str(args.slo_d_ms)
         if args.fwd_green_ctx:
             env["VLLM_FT_FWD_GREEN_CTX"] = "1"
         if args.sched_mode == "green_ctx" or args.fwd_green_ctx:
@@ -726,7 +882,7 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         "serve",
         MODEL_DIR,
         "--tensor-parallel-size",
-        "2",
+        str(args.tp_size),
         "--enable-expert-parallel",
         "--enable-ep-weight-filter",
         "--all2all-backend",
@@ -798,14 +954,28 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         # completion log (written by bt_lora_trainer via the BT_COMPLETIONS path).
         # The file contains one Unix timestamp per completed training step.
         # Fall back to the synthetic-mode completions parser if no steps logged.
+        # C+D_dynamic fuses a per-step SLO-solved window <= t_ft_max, not a
+        # fixed t_ft -- t_ft_max is only an upper bound here, so fwd_bwd_tok_s
+        # (which assumes every pass moved exactly t_ft tokens) overstates
+        # dynamic-mode throughput; flagged in the note rather than silently
+        # reported as if it were exact, since per-pass window sizes aren't
+        # aggregated into this log today.
+        _report_t_ft = args.t_ft_max if args.ft_mode == "C+D_dynamic" else args.t_ft
         training = _parse_bt_completions(
-            BT_COMPLETIONS, t_bench_start, t_bench_end, t_ft=args.t_ft
+            BT_COMPLETIONS, t_bench_start, t_bench_end, t_ft=_report_t_ft
         )
+        if args.ft_mode == "C+D_dynamic" and "note" in training:
+            training["note"] += (
+                f" (t_ft={_report_t_ft} is a max, not fixed -- see [window] "
+                "server log for the actual per-step solved window)"
+            )
         # Annotate whether real or synthetic training ran
         if lora_path and training.get("training_steps", 0) > 0:
             training["note"] = (
                 "real LoRA training (q/k/v/o rank=16, alpaca-cleaned, "
-                f"t_ft={args.t_ft}, adapter={Path(lora_path).name})"
+                f"t_ft={_report_t_ft}"
+                + (" (max)" if args.ft_mode == "C+D_dynamic" else "")
+                + f", adapter={Path(lora_path).name})"
             )
     else:
         training = {
@@ -823,6 +993,7 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         "trace_file": str(args.trace_file) if args.trace_file else None,
         "real_training": bool(lora_path),
         "enable_eplb": args.enable_eplb,
+        "tp_size": args.tp_size,
     }
     if args.ft:
         config["combined_mode"] = args.ft_mode
@@ -831,6 +1002,17 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         config["fwd_green_ctx"] = args.fwd_green_ctx
         if args.sched_mode == "green_ctx" or args.fwd_green_ctx:
             config["green_ctx_sms"] = args.green_ctx_sms
+        # Recorded explicitly so result JSONs are self-documenting about which
+        # arm actually ran (an earlier compare_results/armB_*/ folder was
+        # mislabeled -- it had bwd_mode implicitly "bubble", i.e. arm C, with
+        # nothing in the JSON to catch that after the fact).
+        config["bwd_mode"] = args.bwd_mode
+        if args.bwd_mode in ("slo_budget", "slo_budget_both"):
+            config["slo_d_ms"] = args.slo_d_ms
+        if args.ft_mode == "C+D_dynamic":
+            config["t_ft_max"] = args.t_ft_max
+            config["window_overhead_frac"] = args.window_overhead_frac
+            config["window_probe_cycle"] = args.window_probe_cycle
 
     result = {
         "system": "bubble_tea",
@@ -1100,8 +1282,37 @@ def main() -> None:
     parser.add_argument(
         "--ft-mode",
         default="C+D",
-        choices=["C+D", "D+D", "C+D_batch", "B+D"],
-        help="BubbleTea training mode (default: C+D)",
+        choices=["C+D", "D+D", "C+D_batch", "B+D", "C+D_dynamic"],
+        help="BubbleTea training mode (default: C+D). C+D_dynamic is C+D_batch's "
+        "MoE-FFN token fusion with a per-step SLO-solved window instead of a "
+        "fixed --t-ft size -- see --t-ft-max/--window-overhead-frac/"
+        "--window-probe-cycle.",
+    )
+    parser.add_argument(
+        "--t-ft-max",
+        type=int,
+        default=512,
+        help="Max FT tokens the trainer produces per round for --ft-mode "
+        "C+D_dynamic (VLLM_FT_COMBINED_T_FT_MAX; default 512). The solved "
+        "per-step window is clamped to this; --t-ft is ignored in this mode.",
+    )
+    parser.add_argument(
+        "--window-overhead-frac",
+        type=float,
+        default=0.15,
+        help="Relative per-bucket SLO ceiling for --ft-mode C+D_dynamic's "
+        "window solve: don't let a step's latency exceed (1+frac)*l0 for its "
+        "own n_tok bucket (VLLM_FT_WINDOW_OVERHEAD_FRAC; default 0.15).",
+    )
+    parser.add_argument(
+        "--window-probe-cycle",
+        type=int,
+        default=10,
+        help="Probe cadence (in steps, per n_tok bucket) for --ft-mode "
+        "C+D_dynamic's window solver's l0/l1 liveness probes "
+        "(VLLM_FT_WINDOW_PROBE_CYCLE; default 10 -- unvalidated starting "
+        "guess, needs its own calibration pass, see session notes on "
+        "VLLM_FT_EP_STARVE_PROBE_CYCLE's cycle=10->3 retune).",
     )
     parser.add_argument(
         "--trigger-rank",
@@ -1131,6 +1342,26 @@ def main() -> None:
         help="SMs dedicated to training in green_ctx mode (default: 8)",
     )
     parser.add_argument(
+        "--bwd-mode",
+        default="bubble",
+        choices=["bubble", "decode", "both", "slo_budget", "slo_budget_both"],
+        help="Backward sub-op trigger (VLLM_FT_BWD_MODE): bubble (default, "
+        "EP-bubble gated), decode (fixed per-layer count during decode, "
+        "LLMStation-style), both (bubble + fixed-count decode), slo_budget "
+        "(Arm B: LLMStation's actual Eq. 1 SLO-budget rule, solved per "
+        "decode iteration instead of a fixed count), or slo_budget_both "
+        "(Arm B+C: slo_budget's decode dispatch + bubble-gated prefill "
+        "dispatch, both active -- see moe_runner.py)",
+    )
+    parser.add_argument(
+        "--slo-d-ms",
+        type=float,
+        default=80.0,
+        help="Decode-iteration SLO in ms for --bwd-mode slo_budget's Eq. 1 "
+        "solve (VLLM_FT_SLOD_MS; default 80, matching the LLMStation "
+        "paper's larger-model default)",
+    )
+    parser.add_argument(
         "--ft",
         default=True,
         action=argparse.BooleanOptionalAction,
@@ -1145,6 +1376,15 @@ def main() -> None:
         "(--enable-eplb + --eplb-config, same 8-redundant-expert async "
         "config as scripts/run_qwen3_30b_a3b.sh). Default: off, matching "
         "every prior sweep in this file's history.",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=2,
+        help="Tensor-parallel (and expert-parallel) size for the bubble_tea "
+        "server, and number of GPUs (0..tp_size-1) exposed via "
+        "CUDA_VISIBLE_DEVICES. Default: 2, matching every prior sweep in "
+        "this file's history. Untested above 2 as of 2026-07-16.",
     )
     args = parser.parse_args()
     MODEL_DIR = args.model

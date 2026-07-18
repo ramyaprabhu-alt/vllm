@@ -239,8 +239,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             try:
                 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
                     ft_moe_get_hidden, ft_moe_advance, ft_moe_get_hidden_event,
+                    ft_moe_get_window,
                 )
-                ft_h = ft_moe_get_hidden()
+                ft_h = ft_moe_get_hidden(window=ft_moe_get_window())
                 if ft_h is not None:
                     # In real-training C+D_batch mode the hidden state was written
                     # on bwd_stream by the attention sub-op.  Wait for that event
@@ -858,7 +859,7 @@ class Qwen3MoeForCausalLM(
         try:
             import torch
             from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
-                register_bt_trainer,
+                register_bt_trainer, combined_t_ft,
             )
             import sys, pathlib
             _root = str(pathlib.Path(__file__).parents[3])  # → /mnt/nfs/home/ramya/vllm
@@ -873,7 +874,7 @@ class Qwen3MoeForCausalLM(
             cache_dir = os.environ.get(
                 "VLLM_FT_CACHE_DIR", "/mnt/nfs/home/ramya/scratch"
             )
-            t_ft        = int(os.environ.get("VLLM_FT_COMBINED_T_FT",    "128"))
+            t_ft        = combined_t_ft()
             accum_steps = int(os.environ.get("VLLM_FT_ACCUM_STEPS",     "4"))
             device = torch.cuda.current_device()
 

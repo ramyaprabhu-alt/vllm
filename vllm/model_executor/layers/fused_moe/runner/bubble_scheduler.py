@@ -85,6 +85,18 @@ _SCHED_MODE: str = os.environ.get("VLLM_FT_SCHED_MODE", "bubble")
 # inference), so SM isolation helps. The backward runs in EP bubbles (GPU
 # mostly idle), so it stays on a regular stream.
 _FWD_GREEN_CTX: bool = os.environ.get("VLLM_FT_FWD_GREEN_CTX", "0") == "1"
+# VLLM_FT_BWD_GREEN_CTX=1 keeps the backward scheduler on the normal
+# externally-triggered VllmBubbleScheduler (so VLLM_FT_BWD_MODE's
+# bubble/decode/both phase-gating in moe_runner.py is unchanged), but runs
+# its sub-ops on a green-context stream with a hard-capped SM budget instead
+# of a plain high-priority stream. This models a fixed, MPS-style resource
+# carve-out for training (a static slice of SMs it always holds, contending
+# with inference regardless of GPU idle state) rather than a soft CUDA
+# stream-priority hint — the point being to show that a statically-allocated
+# training budget (arm B's mechanism, and LLMStation's MPS-based one) forces
+# a direct throughput/decode-SLO tradeoff that bubble-gated dispatch (arm C,
+# which only ever runs in windows the GPU was already idle) does not.
+_BWD_GREEN_CTX: bool = os.environ.get("VLLM_FT_BWD_GREEN_CTX", "0") == "1"
 # Number of SMs to dedicate to training in green_ctx modes.
 _GREEN_CTX_SMS: int = int(os.environ.get("VLLM_FT_GREEN_CTX_SMS", "8"))
 
@@ -155,6 +167,7 @@ class VllmBubbleScheduler:
         post_complete_fn: Callable[[], None] | None = None,
         label: str = "sched",
         stream: "torch.cuda.Stream | None" = None,
+        on_subop_done: Callable[[float], None] | None = None,
     ):
         """
         Parameters
@@ -172,6 +185,13 @@ class VllmBubbleScheduler:
             Optional external CUDA stream (e.g. from a green context).
             When provided, sub-ops run on this stream instead of a
             newly-created low-priority stream.
+        on_subop_done :
+            Optional callback invoked once per sub-op with its measured
+            elapsed time in milliseconds (via CUDA events), after
+            bwd_stream.synchronize() so elapsed_time() is safe. Independent
+            of VLLM_FT_TIMING/_flush_subop_timings (which only logs to file)
+            -- used e.g. by VLLM_FT_BWD_MODE=slo_budget to feed the lp EWMA
+            for Eq. 1 (see moe_runner.py's _on_slo_budget_subop_done).
         """
         if device is not None:
             torch.cuda.set_device(device)
@@ -181,6 +201,7 @@ class VllmBubbleScheduler:
         self._n_ops = len(self._sub_ops)
         self._cursor = 0            # next un-signalled sub-op index
         self._post_complete_fn = post_complete_fn
+        self._on_subop_done = on_subop_done
         self._label = label
 
         self.subops_in_bubble = 0   # dispatched before fill_remaining()
@@ -219,6 +240,8 @@ class VllmBubbleScheduler:
     def _run_worker(self) -> None:
         torch.cuda.set_device(self._device)
         _timing = _FT_TIMING
+        _track_lp = self._on_subop_done is not None
+        _need_events = _timing or _track_lp
         _t_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
         # vLLM workers run inside torch.inference_mode().  Backward passes
         # need grad computation, so we exit inference mode on this thread.
@@ -232,19 +255,38 @@ class VllmBubbleScheduler:
                     # waiting for it gates the sub-op to the actual idle window.
                     if event is not None:
                         self._bwd_stream.wait_event(event)
-                    if _timing:
+                    if _need_events:
                         t0 = torch.cuda.Event(enable_timing=True)
                         t1 = torch.cuda.Event(enable_timing=True)
                         t0.record()
                         sub_op()
                         t1.record()
-                        _t_events.append(
-                            (getattr(sub_op, '__name__', f'op{i}'), t0, t1)
-                        )
+                        if _timing:
+                            _t_events.append(
+                                (getattr(sub_op, '__name__', f'op{i}'), t0, t1)
+                            )
+                        if _track_lp:
+                            # Synchronize *this* sub-op only (blocks the
+                            # worker thread, never the main inference stream:
+                            # fill_one() just releases a semaphore and
+                            # returns regardless of how far behind the
+                            # worker is) so lp updates in real time within
+                            # the current job. Deferring to job-end like the
+                            # _FT_TIMING file log below would leave lp at
+                            # None -- and therefore Eq. 1's Np pinned at the
+                            # "probe" value of 1 sub-op/iteration -- for the
+                            # entire job, which is what made the first
+                            # smoke test's slo_budget run dispatch far too
+                            # slowly to ever finish a backward pass.
+                            t1.synchronize()
+                            try:
+                                self._on_subop_done(t0.elapsed_time(t1))
+                            except Exception:
+                                pass
                     else:
                         sub_op()
             self._bwd_stream.synchronize()
-        # Collect timings after sync — elapsed_time() is safe now.
+        # Collect file-log timings after full sync — elapsed_time() is safe now.
         if _timing and _t_events:
             _flush_subop_timings(self._label, _t_events)
         if self._post_complete_fn is not None:
@@ -570,13 +612,21 @@ def make_scheduler(
     post_complete_fn: Callable[[], None] | None = None,
     label: str = "sched",
     is_forward: bool = False,
+    on_subop_done: Callable[[float], None] | None = None,
 ) -> VllmBubbleScheduler | GreenCtxScheduler:
     """Create the appropriate scheduler.
 
-    Backward scheduler type is controlled by VLLM_FT_SCHED_MODE.
+    Backward scheduler type is controlled by VLLM_FT_SCHED_MODE (bubble vs.
+    green_ctx, continuous/ungated) and, independently, VLLM_FT_BWD_GREEN_CTX
+    (keeps VLLM_FT_BWD_MODE's phase gating but runs on a fixed-SM-budget
+    green-context stream instead of a priority-hint stream — see the
+    _BWD_GREEN_CTX comment above).
     Forward scheduler uses a green context stream when VLLM_FT_FWD_GREEN_CTX=1
     (the forward runs during decode, competing with inference — SM isolation
     helps there; the backward runs in EP bubbles where the GPU is idle).
+    on_subop_done is forwarded to VllmBubbleScheduler (ignored by
+    GreenCtxScheduler, which has no per-sub-op event timing); used by
+    VLLM_FT_BWD_MODE=slo_budget to feed Eq. 1's lp EWMA.
     """
     # Backward: green_ctx mode → continuous execution, no bubble gating
     if not is_forward and _SCHED_MODE == "green_ctx":
@@ -594,8 +644,24 @@ def make_scheduler(
             post_complete_fn=post_complete_fn, label=label,
         )
 
+    # Backward with VLLM_FT_BWD_GREEN_CTX=1: keep VLLM_FT_BWD_MODE's
+    # externally-triggered phase gating (bubble/decode/both, still driven by
+    # moe_runner.py's fill_one() calls) but execute on a green-context stream
+    # with a hard-capped SM budget instead of a plain high-priority stream —
+    # a fixed resource carve-out standing in for MPS's per-client SM
+    # percentage, without the subprocess/IPC machinery real MPS would need.
+    if not is_forward and _BWD_GREEN_CTX:
+        dev = device if device is not None else torch.cuda.current_device()
+        gctx_stream = _get_green_ctx_stream(dev, _GREEN_CTX_SMS)
+        return VllmBubbleScheduler(
+            sub_ops, device=device,
+            post_complete_fn=post_complete_fn, label=label,
+            stream=gctx_stream, on_subop_done=on_subop_done,
+        )
+
     # Default: regular low-priority stream with bubble gating
     return VllmBubbleScheduler(
         sub_ops, device=device,
         post_complete_fn=post_complete_fn, label=label,
+        on_subop_done=on_subop_done,
     )

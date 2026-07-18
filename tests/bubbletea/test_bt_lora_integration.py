@@ -15,7 +15,14 @@ Requires:
   - ~10 minutes wall time (model load ~5 min + warmup + 20 reqs)
 """
 
-import os, re, signal, subprocess, sys, time, unittest, urllib.request
+import contextlib
+import os
+import re
+import signal
+import subprocess
+import time
+import unittest
+import urllib.request
 from pathlib import Path
 
 # ── Config (mirrors compare_benchmark.py) ─────────────────────────────────────
@@ -55,10 +62,8 @@ def _kill_server(port: int) -> None:
     try:
         out = subprocess.check_output(['lsof', '-ti', f':{port}'], text=True).strip()
         for pid in out.splitlines():
-            try:
+            with contextlib.suppress(Exception):
                 os.kill(int(pid), signal.SIGTERM)
-            except Exception:
-                pass
     except Exception:
         pass
     time.sleep(4)
@@ -76,7 +81,8 @@ def _kill_server(port: int) -> None:
 
 def _send_request(prompt: str, port: int, max_tokens: int = 32) -> dict | None:
     """Send one inference request to the server. Returns parsed JSON or None."""
-    import json, urllib.error
+    import json
+    import urllib.error
     body = json.dumps({
         'model':       MODEL_DIR,
         'messages':    [{'role': 'user', 'content': prompt}],
@@ -209,7 +215,7 @@ class TestBubbleTeaLoRAIntegration(unittest.TestCase):
         training fires.  Falls back to short prompts if the arxiv file is
         missing (smoke-test only in that case).
         """
-        import json, threading
+        import json
 
         arxiv_path = Path('/mnt/nfs/home/ramya/scratch/arxiv_bench_500.jsonl')
         if arxiv_path.exists():

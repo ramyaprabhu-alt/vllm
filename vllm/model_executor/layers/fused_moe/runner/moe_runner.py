@@ -63,6 +63,536 @@ _sched_trigger_rank: int | None = None  # only this rank fires; None = all ranks
 # Used to fire pause_decode() / resume_prefill() exactly once per transition.
 _bwd_sched_in_decode: bool = False
 
+# Nd_all for Eq. 1 of the LLMStation paper (§4.2): the decode batch size as of
+# the most recent decode-scale MoE layer call. Under vLLM's continuous
+# batching, a decode step advances exactly one token per running sequence
+# (absent speculative decoding), so n_tok on a decode-scale call already IS
+# Nd_all -- "the total number of decoding tasklets that need to be completed
+# in the upcoming iteration". No separate query into the engine's scheduler
+# is needed; the mainline V1 FlashAttention metadata doesn't even carry a
+# decode/prefill token split (chunked prefill unifies the two), so reusing
+# this file's own n_tok >= _sched_min_tokens phase heuristic is the correct
+# signal, not a shortcut around a more precise one.
+# Diagnostic/logging only as of the real slo_budget implementation below --
+# NOT plugged into _solve_np's nd_all (that's called with nd_all=1; see
+# _solve_np's docstring for why the real batch size would double-count
+# against our whole-iteration ld/ld0 measurement). Kept for observability
+# and as the hook a future learned latency predictor (matching the paper's
+# own approach more closely) would consume as a feature.
+_current_decode_batch_size: int = 0
+
+
+def get_current_decode_batch_size() -> int:
+    """Return Nd_all: decode batch size as of the most recent decode step.
+
+    Zero before the first decode-scale MoE layer call is observed (e.g.
+    during the very first prefill of a run). Callers should treat 0
+    defensively.
+    """
+    return _current_decode_batch_size
+
+# ── Backward trigger mode (base-scheduler ablation) ──────────────────────────
+# VLLM_FT_BWD_MODE controls which phase(s) are allowed to release backward
+# sub-ops, independent of the bubble-gating logic itself:
+#   bubble  — (default) dispatch gated to TP all_reduce idle windows during
+#              prefill only; decode is fully suspended via pause_decode() /
+#              resume_prefill(). The bubble-aware policy (state-based trigger).
+#   decode  — dispatch suspended during prefill (prefill fully yields, no
+#              fill_one() calls at all); released continuously during decode
+#              steps instead, budgeted by VLLM_FT_BWD_DECODE_FILLS_PER_TRIGGER
+#              per MoE layer. Faithful to LLMStation's phase-gated rule (ATC'25
+#              paper §3): PEFT suspended during prefill, tasklets run fused
+#              with decode. No pause_decode()/resume_prefill() — decode is now
+#              an intentional drain channel, not something to protect.
+#   both    — both channels active concurrently: prefill bubbles AND decode
+#              dispatch drain the same sub-op queue (no pause/drain either).
+#   slo_budget — LLMStation's *actual* decision rule (ATC'25 paper §4.2,
+#              Eq. 1), not a fixed per-layer count: every decode iteration,
+#              solve for the max number of sub-ops Np that fits under the
+#              decode SLO given the current decode batch size (Nd_all) and
+#              EWMA-estimated decode/sub-op latencies (ld0, ld, lp). See
+#              _solve_np() / _slo_budget_decode_step() below. This is Arm B
+#              from ~/vllm/session_2026-07-02.md, made real.
+#   slo_budget_both — Arm B+C: prefill-bubble dispatch (same trigger as
+#              "bubble"/"both", i.e. arm C's idle-window harvesting) AND
+#              slo_budget's Eq.-1-budgeted decode dispatch, both active
+#              concurrently. Well-defined without any extra plumbing because
+#              B and C already operate on disjoint phases (decode vs.
+#              prefill) and drain the same sub-op cursor -- unlike "both",
+#              which pairs bubble-prefill dispatch with the *fixed*-count
+#              decode rule instead of the SLO-budget one.
+_bwd_mode: str = os.environ.get("VLLM_FT_BWD_MODE", "bubble")
+_bwd_decode_fills_per_trigger: int = int(
+    os.environ.get("VLLM_FT_BWD_DECODE_FILLS_PER_TRIGGER", "1")
+)
+# Sub-ops released via decode-mode dispatch this job — separate from the
+# scheduler's own subops_in_bubble/subops_after so decode-channel volume can
+# be attributed independently of prefill-bubble volume. Reset per job in
+# arm_bubble_scheduler(), read/logged at disarm_bubble_scheduler() time.
+_bwd_subops_in_decode: int = 0
+
+# ── Eq. 1 (LLMStation paper §4.2) state, for VLLM_FT_BWD_MODE=slo_budget ────
+# Decode-iteration SLO budget (seconds). Paper defaults: 50ms for an 8B model,
+# 80ms for larger models -- 80ms is the more representative default here
+# given Qwen3-30B-A3B is this repo's benchmark model.
+_slo_d_s: float = float(os.environ.get("VLLM_FT_SLOD_MS", "80")) / 1000
+_ewma_alpha: float = 0.2
+
+
+def _ewma_update(prev: float | None, sample: float, alpha: float = _ewma_alpha) -> float:
+    return sample if prev is None else (1 - alpha) * prev + alpha * sample
+
+
+class _LatBucket:
+    """ld0/ld estimates for one decode-batch-size bucket.
+
+    Mirrors the LLMStation paper's own design (§4.2): their latency cache is
+    keyed by "(decode batch size, PEFT input length)", not one global
+    average -- a single blended EWMA across every batch size that occurs
+    cross-contaminates wildly different load regimes. Found directly: a
+    sample taken at nd_all~87 got frozen into a global `ld`, then got
+    compared against nd_all=2..13 for the rest of an 8-minute run, pinning
+    Np=0 forever even as the real batch shrank back to something Np>0 should
+    have applied to. t_ft (PEFT input length) is fixed at 128 in this repo,
+    so it's not a second bucketing dimension here.
+    """
+    __slots__ = ("ld0", "ld", "iters")
+
+    def __init__(self) -> None:
+        self.ld0: float | None = None
+        self.ld: float | None = None
+        self.iters: int = 0
+
+
+# bucket_id -> _LatBucket. bucket_id = floor(log2(nd_all)), so nd_all=2-3
+# share a bucket, 4-7 share the next, etc. -- coarse enough that a real
+# workload revisits the same bucket often (letting its EWMA converge),
+# fine enough to separate genuinely different load regimes.
+_ld_bucket_cache: dict[int, "_LatBucket"] = {}
+# lp is NOT bucketed by nd_all: it's fed asynchronously by the worker thread
+# (_on_slo_budget_subop_done, after bwd_stream sync), by which time the main
+# thread may already be several decode iterations further along -- precise
+# per-bucket attribution isn't practical with that dispatch model. It's also
+# a much weaker function of decode batch size than ld0/ld are (SM
+# contention only, not the primary driver), so one global EWMA is a
+# reasonable simplification here.
+_lp_ewma: float | None = None
+
+# Dedicated decode-iteration-boundary counter. Deliberately separate from
+# _bubble_calls (prefill-only, gated by hidden_states.shape[0] >=
+# _BUBBLE_MIN_TOKENS -- see below -- so it never fires during decode).
+# Wraps every _FT_MOE_N_LAYERS calls, the same "how many MoE layers per
+# step" constant already used by _ft_moe_state's layer_count.
+_decode_iter_layer_calls: int = 0
+_decode_iter_t0: float | None = None
+_decode_iter_had_training: bool = False
+_decode_iter_bucket: int = 0  # bucket the just-started iteration belongs to
+_iter_np_budget: int = 0
+_iter_np_dispatched: int = 0
+_slo_budget_iter_count: int = 0  # diagnostic: gates the periodic [slo_budget] log line
+# Every Nth iteration *within a given bucket*, force a zero-dispatch probe
+# (samples ld0) or a forced-nonzero-dispatch probe (keeps ld/lp alive) --
+# see _slo_budget_decode_step for why both are load-bearing, not just an
+# optimization. LLMStation never needs either: their Fusion engine always
+# co-executes only *part* of a decode batch with PEFT (Nd of Nd,all
+# tasklets), so every real iteration naturally samples both ld and ld0
+# simultaneously from different tasklets. Our engine dispatches a sub-op on
+# a separate stream affecting the *whole* iteration's latency, not a
+# per-request partial overlay, so we can't replicate that trick without
+# building an equivalent of their Fusion engine -- these probes are the
+# next-best substitute.
+_PROBE_CYCLE: int = int(os.environ.get("VLLM_FT_SLO_PROBE_CYCLE", "10"))
+
+
+def _nd_all_bucket(nd_all: int) -> int:
+    """floor(log2(nd_all)), clamped to nd_all>=1. See _LatBucket."""
+    return max(nd_all, 1).bit_length() - 1
+
+
+def _solve_np(
+    ld0: float | None,
+    ld: float | None,
+    lp: float | None,
+    nd_all: int,
+    slo_d: float,
+) -> int:
+    """Eq. 1 of the LLMStation paper (§4.2): max training sub-ops this decode
+    iteration under the decode SLO.
+
+        Np <= (SLOd - Nd_all*ld0) * ld / ((ld - ld0) * lp)
+
+    Returns 1 (probe) until all three latency estimates exist, and 0 if
+    training shows no measurable interference yet (denominator <= 0) --
+    conservative in both directions rather than guessing.
+
+    nd_all semantics differ from the paper by design: LLMStation's ld/ld0
+    are *per-tasklet* costs (their engine processes decode tasklets with
+    additive per-request latency, so Nd_all scales them up to a whole-batch
+    cost). Our ld/ld0 are measured as the whole batched decode ITERATION's
+    wall-clock latency (vLLM decodes the entire batch in one fused kernel
+    call) -- Nd_all's batch-size effect is already baked into that
+    measurement. Multiplying by the real batch size again here would
+    double-count it and driven the formula to a permanent Np=0 once ld0
+    stabilizes (found via direct testing: nd_all~87, ld0~56ms drove
+    Nd_all*ld0 to ~4.9s, dwarfing an 80ms SLO). Call this with nd_all=1.
+    """
+    if ld0 is None or ld is None or lp is None or lp <= 0:
+        return 1
+    nd_all = max(nd_all, 1)
+    denom = (ld - ld0) * lp
+    if denom <= 0:
+        return 0
+    headroom = (slo_d - nd_all * ld0) * ld
+    return max(0, int(headroom / denom))
+
+
+def _slo_budget_decode_step(n_tok: int) -> int:
+    """Called once per decode-scale MoE layer call when VLLM_FT_BWD_MODE ==
+    "slo_budget". Detects decode-iteration boundaries, finalizes the
+    just-completed iteration's ld/ld0 sample into its batch-size bucket,
+    (re)solves the Np budget for the new iteration from its own bucket, and
+    returns how many more sub-ops this iteration's budget still allows (the
+    caller dispatches fill_one() that many times, capped by has_work()).
+    """
+    global _decode_iter_layer_calls, _decode_iter_t0, _decode_iter_had_training
+    global _decode_iter_bucket, _iter_np_budget, _iter_np_dispatched
+    global _lp_ewma, _slo_budget_iter_count
+
+    _decode_iter_layer_calls += 1
+    if _decode_iter_layer_calls % _FT_MOE_N_LAYERS == 1:
+        now = time.perf_counter()
+        nd_all = get_current_decode_batch_size() or n_tok
+        new_bucket_id = _nd_all_bucket(nd_all)
+
+        if _decode_iter_t0 is not None:
+            elapsed = now - _decode_iter_t0
+            finished_bucket = _ld_bucket_cache.setdefault(_decode_iter_bucket, _LatBucket())
+            if _decode_iter_had_training:
+                finished_bucket.ld = _ewma_update(finished_bucket.ld, elapsed)
+            else:
+                finished_bucket.ld0 = _ewma_update(finished_bucket.ld0, elapsed)
+
+        _decode_iter_t0 = now
+        _decode_iter_had_training = False
+        _decode_iter_bucket = new_bucket_id
+
+        cur_bucket = _ld_bucket_cache.setdefault(new_bucket_id, _LatBucket())
+        cur_bucket.iters += 1
+        _slo_budget_iter_count += 1
+
+        solved = _solve_np(cur_bucket.ld0, cur_bucket.ld, _lp_ewma, nd_all=1, slo_d=_slo_d_s)
+        cycle = cur_bucket.iters % _PROBE_CYCLE
+        if cycle == 0:
+            # ld0 probe: force zero dispatch this iteration so a
+            # no-training sample gets recorded for *this bucket* even
+            # while training keeps running. Without this, Np>=1 dispatches
+            # successfully whenever backward work remains, ld0 in this
+            # bucket is never sampled, and Np stays pinned at the
+            # "missing estimate" value of 1 forever.
+            _iter_np_budget = 0
+        elif cycle == _PROBE_CYCLE // 2:
+            # ld/lp liveness probe: force at least 1 dispatch even if the
+            # solved budget is 0, so ld/lp for this bucket can't freeze on
+            # a stale (possibly anomalous) sample forever. Observed
+            # directly without this: one ld sample of 1081ms got locked in
+            # at iter~61 and never updated again through iter 4301+ (a
+            # full 8-minute run), because Np=0 -> no dispatch -> ld never
+            # gets a fresh sample -> Np stays 0 -> repeat, forever.
+            _iter_np_budget = max(1, solved)
+        else:
+            _iter_np_budget = solved
+        _iter_np_dispatched = 0
+
+        if _slo_budget_iter_count % 20 == 1:
+            logger.info(
+                "[slo_budget] iter=%d bucket=%d(nd_all~%d) ld0=%s ld=%s lp=%s -> Np=%d",
+                _slo_budget_iter_count, new_bucket_id, nd_all,
+                f"{cur_bucket.ld0*1000:.2f}ms" if cur_bucket.ld0 is not None else None,
+                f"{cur_bucket.ld*1000:.2f}ms" if cur_bucket.ld is not None else None,
+                f"{_lp_ewma*1000:.3f}ms" if _lp_ewma is not None else None,
+                _iter_np_budget,
+            )
+
+    return max(0, _iter_np_budget - _iter_np_dispatched)
+
+
+def _on_slo_budget_subop_done(elapsed_ms: float) -> None:
+    """Passed as VllmBubbleScheduler's on_subop_done in slo_budget mode.
+
+    Updates lp's EWMA from real per-sub-op CUDA-event timing (elapsed_ms is
+    measured on the worker thread after bwd_stream sync, see
+    bubble_scheduler.py's _run_worker).
+    """
+    global _lp_ewma
+    _lp_ewma = _ewma_update(_lp_ewma, elapsed_ms / 1000)
+
+
+# ── Token-window solve, for VLLM_FT_COMBINED_MODE=C+D_dynamic ──────────────
+# C+D_batch fuses a *fixed* t_ft-token FT batch into every MoE-FFN call
+# (see _ft_moe_state below). C+D_dynamic keeps that same fusion mechanism
+# but replaces the fixed size with a per-step window `s`, solved from an SLO
+# budget -- the token-level analogue of _solve_np/_slo_budget_decode_step
+# above, generalized to run on *every* step (prefill and decode alike, no
+# is_prefill exclusion) since the fusion call site itself is already
+# phase-agnostic (ft_moe_advance() re-arms unconditionally regardless of
+# phase; only the old C+D_batch arming condition was decode-gated).
+#
+# lp_ewma (slo_budget's global, un-bucketed per-sub-op cost) does not carry
+# over here: the marginal cost of fusing `s` extra rows into a batch of
+# n_tok inference tokens is a function of n_tok itself (compute-bound
+# prefill vs. memory-bound decode have categorically different
+# per-added-token costs), so it must be bucketed the same way l0/l1 are,
+# not a single global average.
+_WINDOW_OVERHEAD_FRAC: float = float(
+    os.environ.get("VLLM_FT_WINDOW_OVERHEAD_FRAC", "0.15")
+)
+# Deliberately its own env var, not a reuse of VLLM_FT_SLO_PROBE_CYCLE's
+# value: the EP anti-starvation floor's cycle=10 default (chosen by analogy
+# to _PROBE_CYCLE) was measured too loose and had to be retuned to 3 by
+# direct measurement (see moe_runner.py's _EP_STARVE_PROBE_CYCLE and
+# session notes). This constant needs its own calibration pass rather than
+# inheriting a value tuned for an unrelated control loop.
+_WINDOW_PROBE_CYCLE: int = int(
+    os.environ.get("VLLM_FT_WINDOW_PROBE_CYCLE", "10")
+)
+
+
+class _WindowBucket:
+    """l0/l1 estimates for one n_tok bucket, for C+D_dynamic's window solve.
+
+    Mirrors _LatBucket's per-bucket rationale (see its docstring), bucketed
+    by _nd_all_bucket(n_tok) directly and reused unmodified -- floor(log2
+    (n_tok)) already separates decode-scale steps (n_tok in the tens to low
+    hundreds) from prefill-scale steps (n_tok in the thousands) without
+    needing an explicit phase tag, which is what lets one control loop cover
+    both phases.
+    """
+    __slots__ = ("l0", "l1", "s_prev", "iters")
+
+    def __init__(self) -> None:
+        self.l0: float | None = None   # EWMA whole-step latency, s=0 this bucket
+        self.l1: float | None = None   # EWMA whole-step latency, s=s_prev>0 this bucket
+        self.s_prev: int = 0           # the s used for the most recent l1 sample
+        self.iters: int = 0
+
+
+_window_bucket_cache: dict[int, "_WindowBucket"] = {}
+
+_window_layer_calls: int = 0
+_window_step_t0: float | None = None
+_window_step_bucket: int = 0
+_window_step_s: int = 0    # s used for the step that just finished
+_window_cache_val: int = 0  # s for the step currently in progress
+_window_iter_count: int = 0  # diagnostic: gates the periodic [window] log line
+
+
+def _solve_window(
+    l0: float | None,
+    l1: float | None,
+    s_prev: int,
+    overhead_frac: float,
+    t_ft_max: int,
+) -> int:
+    """Token-window analogue of _solve_np: max FT tokens `s` to fuse into
+    this step's MoE-FFN batch under a *relative* SLO ceiling.
+
+        marginal = (l1 - l0) / s_prev            # est. seconds per fused FT token
+        budget   = overhead_frac * l0             # = (1+overhead_frac)*l0 - l0
+        s        = budget / marginal
+
+    A relative (per-bucket) ceiling is used instead of a flat absolute one
+    (e.g. VLLM_FT_SLOD_MS) deliberately: an absolute ~80ms decode-iteration
+    SLO applied verbatim to a multi-hundred-ms unchunked prefill step would
+    have l0 alone already exceed it, silently degenerating to s=0 on every
+    prefill step forever -- reproducing the exact is_prefill-gated behavior
+    this mode exists to avoid, without ever surfacing as a bug. A relative
+    ceiling is scale-invariant across the prefill/decode l0 range by
+    construction.
+
+    Returns 1 (probe) until l0/l1/s_prev exist, and 0 if fusion shows no
+    measurable marginal cost yet (denominator <= 0) -- same "conservative
+    both ways" behavior as _solve_np.
+    """
+    if l0 is None or l1 is None or s_prev <= 0:
+        return 1
+    marginal = (l1 - l0) / s_prev
+    if marginal <= 0:
+        return 0
+    s = int(overhead_frac * l0 / marginal)
+    return max(0, min(s, t_ft_max))
+
+
+def _sync_window_across_ep(s: int) -> int:
+    """MIN-all-reduce the locally solved window across the EP group so every
+    rank fuses the SAME number of FT tokens this step.
+
+    This is load-bearing, not an optimization: `s` is solved per-rank from
+    that rank's own local wall-clock EWMA timing (time.perf_counter() in
+    _window_step_boundary), which jitters slightly rank-to-rank -- unlike
+    _ep_is_light_rank's verdict (deterministic from TP-replicated
+    router_logits/n_tok, no communication needed) or C+D_batch's fixed t_ft
+    (a shared env-var constant, same on every rank by construction). An
+    un-synced `s` reliably deadlocks self.experts()'s EP dispatch/combine
+    all-to-all the first time two ranks' locally solved values disagree --
+    confirmed directly: an earlier version without this sync hung the whole
+    server (all workers wedged in the collective) a few dozen steps in.
+    MIN, not mean/rank-0-broadcast, so the synced value never exceeds any
+    rank's own local SLO estimate. Uses the EP group's cpu_group (gloo) --
+    a tiny host-side metadata exchange, not the device_group NCCL stream
+    self.experts() itself uses for the real all-to-all -- following the same
+    cpu_group-for-metadata pattern already used by GroupCoordinator's own
+    send/recv size-exchange calls.
+    """
+    try:
+        import torch
+        import torch.distributed as dist
+        t = torch.tensor([s], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=get_ep_group().cpu_group)
+        return int(t.item())
+    except Exception:
+        # No distributed group initialized (e.g. single-GPU manual testing)
+        # -- fall back to the unsynced local value.
+        return s
+
+
+def _window_step_boundary(n_tok: int, t_ft_max: int) -> int:
+    """Called once per MoE layer call, every step (prefill or decode --
+    deliberately no is_prefill exclusion, unlike _slo_budget_decode_step),
+    when VLLM_FT_COMBINED_MODE == "C+D_dynamic". Detects step boundaries via
+    the same _FT_MOE_N_LAYERS-modulo idiom as _slo_budget_decode_step /
+    _iter_log_step_boundary, finalizes the just-completed step's latency
+    sample into its n_tok bucket's l0/l1, (re)solves the window `s` for the
+    new step from that bucket, and caches it so it stays fixed across all
+    MoE-layer calls within this one step (mirroring how n_tok itself is
+    step-constant). Returns the window for the caller to store/use.
+    """
+    global _window_layer_calls, _window_step_t0, _window_step_bucket
+    global _window_step_s, _window_cache_val, _window_iter_count
+
+    _window_layer_calls += 1
+    if _window_layer_calls % _FT_MOE_N_LAYERS == 1:
+        now = time.perf_counter()
+        new_bucket_id = _nd_all_bucket(n_tok)
+
+        if _window_step_t0 is not None:
+            elapsed = now - _window_step_t0
+            finished_bucket = _window_bucket_cache.setdefault(
+                _window_step_bucket, _WindowBucket()
+            )
+            if _window_step_s > 0:
+                finished_bucket.l1 = _ewma_update(finished_bucket.l1, elapsed)
+                finished_bucket.s_prev = _window_step_s
+            else:
+                finished_bucket.l0 = _ewma_update(finished_bucket.l0, elapsed)
+
+        _window_step_t0 = now
+        _window_step_bucket = new_bucket_id
+
+        cur_bucket = _window_bucket_cache.setdefault(new_bucket_id, _WindowBucket())
+        cur_bucket.iters += 1
+        _window_iter_count += 1
+
+        solved = _solve_window(
+            cur_bucket.l0, cur_bucket.l1, cur_bucket.s_prev,
+            _WINDOW_OVERHEAD_FRAC, t_ft_max,
+        )
+        cycle = cur_bucket.iters % _WINDOW_PROBE_CYCLE
+        if cycle == 0:
+            # l0 probe: force zero-fusion this step so the no-FT baseline
+            # for this bucket keeps getting sampled even while fusion
+            # otherwise always runs -- same rationale as
+            # _slo_budget_decode_step's ld0 probe.
+            _window_step_s = 0
+        elif cycle == _WINDOW_PROBE_CYCLE // 2:
+            # l1/marginal liveness probe: force a nonzero window even if the
+            # solved value is 0, so this bucket's marginal-cost estimate
+            # can't freeze on a stale sample forever.
+            _window_step_s = max(min(8, t_ft_max), solved)
+        else:
+            _window_step_s = solved
+        # cur_bucket.iters/new_bucket_id are identical across ranks (n_tok is
+        # TP-replicated, so bucket assignment and probe-cycle phase can't
+        # diverge), but `solved` itself is derived from each rank's own
+        # local EWMA timing and WILL jitter rank-to-rank -- sync before use,
+        # not after, since this value's shape flows directly into
+        # self.experts()'s EP dispatch/combine collective. See
+        # _sync_window_across_ep's docstring for why this is required, not
+        # optional.
+        _window_step_s = _sync_window_across_ep(_window_step_s)
+        _window_cache_val = _window_step_s
+
+        if _window_iter_count % 20 == 1:
+            logger.info(
+                "[window] iter=%d bucket=%d(n_tok~%d) l0=%s l1=%s s_prev=%d -> s=%d",
+                _window_iter_count, new_bucket_id, n_tok,
+                f"{cur_bucket.l0*1000:.2f}ms" if cur_bucket.l0 is not None else None,
+                f"{cur_bucket.l1*1000:.2f}ms" if cur_bucket.l1 is not None else None,
+                cur_bucket.s_prev, _window_cache_val,
+            )
+
+    return _window_cache_val
+
+
+# ── Per-iteration instrumentation (batch size / phase / sub-op collocation) ──
+# One log line per real inference step (prefill or decode), reporting n_tok,
+# phase, and how many backward/forward sub-ops were dispatched alongside it.
+# Independent of VLLM_FT_BWD_MODE -- works for every arm (bubble/decode/both/
+# slo_budget), not just slo_budget's own [slo_budget] diagnostic above.
+# Gated by VLLM_FT_ITER_LOG=1 (default off): an int increment per MoE layer
+# call is negligible, but the log write and the extra is_prefill computation
+# on every call are skipped entirely unless explicitly requested.
+_ITER_LOG: bool = os.environ.get("VLLM_FT_ITER_LOG", "0") == "1"
+_iter_log_layer_calls: int = 0
+_iter_log_n_tok: int = 0
+_iter_log_is_prefill: bool = False
+_iter_log_bwd_subops: int = 0
+_iter_log_fwd_subops: int = 0
+_iter_log_step_id: int = 0
+
+
+def _iter_log_step_boundary(n_tok: int, is_prefill: bool) -> None:
+    """Called once per MoE layer call (every step, prefill or decode) when
+    VLLM_FT_ITER_LOG=1. Flushes the just-completed step's aggregated
+    (n_tok, phase, bwd/fwd sub-op count) as one log line, then resets the
+    counters for the new step.
+
+    Boundary detection reuses the same _FT_MOE_N_LAYERS-modulo trick as
+    _slo_budget_decode_step, generalized to prefill steps too. register_bt_trainer()
+    sets _FT_MOE_N_LAYERS from the real model's layer count at load time (falling
+    back to the "48" env-var default only if no trainer is registered), so this
+    is exact for whichever model is actually served, not just Qwen3-30B-A3B.
+    """
+    global _iter_log_layer_calls, _iter_log_n_tok, _iter_log_is_prefill
+    global _iter_log_bwd_subops, _iter_log_fwd_subops, _iter_log_step_id
+
+    _iter_log_layer_calls += 1
+    if _iter_log_layer_calls % _FT_MOE_N_LAYERS == 1:
+        if _iter_log_layer_calls > 1:  # nothing to flush before the first step
+            _iter_log_step_id += 1
+            logger.info(
+                "[iter] step=%d phase=%-7s n_tok=%d bwd_subops=%d fwd_subops=%d",
+                _iter_log_step_id,
+                "prefill" if _iter_log_is_prefill else "decode",
+                _iter_log_n_tok, _iter_log_bwd_subops, _iter_log_fwd_subops,
+            )
+        _iter_log_n_tok = n_tok
+        _iter_log_is_prefill = is_prefill
+        _iter_log_bwd_subops = 0
+        _iter_log_fwd_subops = 0
+
+
+def _iter_log_count_bwd(n: int = 1) -> None:
+    if _ITER_LOG:
+        global _iter_log_bwd_subops
+        _iter_log_bwd_subops += n
+
+
+def _iter_log_count_fwd(n: int = 1) -> None:
+    if _ITER_LOG:
+        global _iter_log_fwd_subops
+        _iter_log_fwd_subops += n
+
+
 # Job queue: submit_backward_job() pushes here; the first qualifying prefill
 # dequeues and arms the job automatically.  Enables arming from any thread
 # inside the worker process (e.g. a background SFT training thread).
@@ -84,6 +614,16 @@ _fwd_job_queue: _queue.Queue = _queue.Queue()
 _fwd_sched_min_tokens: int = 512
 _fwd_fills_per_trigger: int = 1
 _fwd_trigger_rank: int | None = None
+
+# ── Forward-side cycle timing (diagnoses whether fwd or bwd paces C+D) ───────
+# Wall-clock timestamps bracketing each stage of one fwd+bwd training cycle:
+#   submit (_submit_combined_fwd_job called) -> armed (dequeued by the
+#   dispatch loop, requires a qualifying batch) -> disarmed (all sub-ops
+#   drained). Logged at disarm_fwd_scheduler() time so a single log line
+#   shows build time, queueing delay, and drain time for the whole cycle.
+_fwd_job_submit_ts: float | None = None
+_fwd_job_build_s: float | None = None   # time inside build_fwd_subops() itself
+_fwd_job_armed_ts: float | None = None
 
 
 class _FwdPrefillState:
@@ -152,6 +692,13 @@ elif _combined_mode == "D+D":
 # _fwd_mode stays "decode" so attn sub-ops still dispatch on the secondary stream.
 elif _combined_mode == "C+D_batch":
     _fwd_mode = "decode"
+# C+D_dynamic: same MoE-FFN fusion mechanism as C+D_batch, but the fixed
+# t_ft-token window is replaced by a per-step SLO-solved window (see
+# _window_step_boundary / ft_moe_get_window above/below). _fwd_mode stays
+# "decode" for the same reason as C+D_batch -- FT attention still dispatches
+# on the secondary stream, unchanged.
+elif _combined_mode == "C+D_dynamic":
+    _fwd_mode = "decode"
 
 
 def combined_t_ft() -> int:
@@ -170,10 +717,10 @@ def combined_t_ft() -> int:
 
 
 # ── FT MoE batch state ────────────────────────────────────────────────────────
-# When C+D_batch is active, the MoE forward for FT tokens is injected directly
-# into each Qwen3MoeSparseMoeBlock.forward() call instead of running on a
-# secondary stream.  A single rolling hidden-state tensor flows through all
-# 48 MoE layers alongside the inference tokens.
+# When C+D_batch (or C+D_dynamic) is active, the MoE forward for FT tokens is
+# injected directly into each Qwen3MoeSparseMoeBlock.forward() call instead of
+# running on a secondary stream.  A single rolling hidden-state tensor flows
+# through all 48 MoE layers alongside the inference tokens.
 _FT_MOE_N_LAYERS: int = int(os.environ.get("VLLM_FT_MOE_N_LAYERS", "48"))
 _ft_moe_state: dict = {
     "active":       False,
@@ -247,9 +794,6 @@ def ft_moe_get_hidden(window: "int | None" = None) -> "torch.Tensor | None":
     if window is None or window >= h.shape[0]:
         return h
     return h[:window]
-
-
-_window_cache_val: int = 0  # s for the step currently in progress
 
 
 def ft_moe_get_window() -> "int | None":
@@ -490,16 +1034,27 @@ def arm_bubble_scheduler(
         overlap with FFN on the non-bubbling rank.
     """
     global _active_scheduler, _sched_min_tokens, _sched_fills_per_trigger
-    global _sched_trigger_rank
+    global _sched_trigger_rank, _bwd_subops_in_decode
     _active_scheduler = sched
     _sched_min_tokens = min_tokens
     _sched_fills_per_trigger = fills_per_trigger
     _sched_trigger_rank = trigger_rank
+    _bwd_subops_in_decode = 0
 
 
 def disarm_bubble_scheduler() -> None:
     """Disarm the bubble scheduler after the backward pass completes."""
     global _active_scheduler, _bwd_sched_in_decode
+    if _active_scheduler is not None:
+        # Logged unconditionally (not just for decode/both) so "bubble" mode
+        # (arm C) job-completion is also visible in the server log — without
+        # this, arm C had no dispatch-completion signal at all, making it
+        # impossible to tell from the log whether/when a job drained.
+        logger.info(
+            "[bwd_mode=%s] job complete: %d sub-ops released via decode "
+            "(%s)",
+            _bwd_mode, _bwd_subops_in_decode, _active_scheduler.summary(),
+        )
     _active_scheduler = None
     _bwd_sched_in_decode = False
     if _FT_TIMING and _pause_timing_pairs:
@@ -558,15 +1113,31 @@ def arm_fwd_scheduler(
     trigger_rank: int | None = None,
 ) -> None:
     global _fwd_active_scheduler, _fwd_sched_min_tokens
-    global _fwd_fills_per_trigger, _fwd_trigger_rank
+    global _fwd_fills_per_trigger, _fwd_trigger_rank, _fwd_job_armed_ts
     _fwd_active_scheduler = sched
     _fwd_sched_min_tokens = min_tokens
     _fwd_fills_per_trigger = fills_per_trigger
     _fwd_trigger_rank = trigger_rank
+    _fwd_job_armed_ts = time.time()
+    if _fwd_job_submit_ts is not None:
+        logger.info(
+            "[fwd cycle] armed %.3fs after submit (build took %.3fs)",
+            _fwd_job_armed_ts - _fwd_job_submit_ts,
+            _fwd_job_build_s if _fwd_job_build_s is not None else -1.0,
+        )
 
 
 def disarm_fwd_scheduler() -> None:
     global _fwd_active_scheduler
+    if _fwd_active_scheduler is not None:
+        now = time.time()
+        drain_s = now - _fwd_job_armed_ts if _fwd_job_armed_ts is not None else -1.0
+        cycle_s = now - _fwd_job_submit_ts if _fwd_job_submit_ts is not None else -1.0
+        logger.info(
+            "[fwd cycle] job complete: drained in %.3fs (full submit->done cycle "
+            "%.3fs) (%s)",
+            drain_s, cycle_s, _fwd_active_scheduler.summary(),
+        )
     _fwd_active_scheduler = None
 
 
@@ -779,8 +1350,11 @@ def _submit_combined_fwd_job() -> None:
     hundreds of VllmBubbleScheduler instances (each with a new CUDA stream)
     to be created, exhausting CUDA stream resources and crashing the worker.
     """
+    global _fwd_job_submit_ts, _fwd_job_build_s
     if not _fwd_job_queue.empty():
         return   # a fwd job is already waiting; don't queue another
+    _fwd_job_submit_ts = time.time()
+    _t_build0 = _fwd_job_submit_ts
     try:
         dev = torch.cuda.current_device()
         if _bt_trainer is not None:
@@ -801,6 +1375,7 @@ def _submit_combined_fwd_job() -> None:
             fwd_ops = build_qwen3_fwd_subops(
                 t_ft=_COMBINED_T_FT, n_layers=48, moe_chunk_size=8, device=dev
             )
+        _fwd_job_build_s = time.time() - _t_build0
         submit_forward_job(
             fwd_ops,
             fills_per_trigger=_COMBINED_FWD_FILLS,
@@ -1641,6 +2216,18 @@ class MoERunner(MoERunnerInterface):
             result = self._maybe_reduce_final_output(result, og_hidden_dim)
             return result
 
+        # Track Nd_all (see get_current_decode_batch_size above) on every
+        # genuine decode-scale call -- must run after the reentrancy guard
+        # above, otherwise a training sub-op's own re-entrant MoE calls
+        # (training batch size, not the inference decode batch) would
+        # clobber it.
+        if n_tok < _sched_min_tokens:
+            global _current_decode_batch_size
+            _current_decode_batch_size = n_tok
+
+        if _ITER_LOG:
+            _iter_log_step_boundary(n_tok, is_prefill=n_tok >= _sched_min_tokens)
+
         # Demo mode: submit first job on the first qualifying prefill.
         global _sched_demo_armed, _fwd_demo_armed, _combined_demo_armed, _fwd_prefill_state
         if _sched_demo_enabled and not _sched_demo_armed and n_tok >= _sched_min_tokens:
@@ -1661,16 +2248,34 @@ class MoERunner(MoERunnerInterface):
             if n_tok < _fwd_sched_min_tokens:  # decode step
                 ft_moe_arm(hidden_states.shape[-1], hidden_states.device.index)
 
-        # C+D_batch real training: submit the attention-only fwd job and the
-        # backward job on the first qualifying step, then keep the chain going
-        # via _combined_fwd_done / _combined_bwd_done (same callbacks as C+D).
-        if _combined_mode == "C+D_batch" and not _combined_demo_armed and _bt_trainer is not None:
+        # C+D_dynamic: same fusion mechanism as C+D_batch, but arm on the
+        # first qualifying step of EITHER phase (not decode-only) -- the
+        # whole point of this mode is that the window solver, not a phase
+        # gate, decides how much (if anything) fuses into a given step.
+        if _combined_mode == "C+D_dynamic" and not _ft_moe_state["active"]:
+            ft_moe_arm(hidden_states.shape[-1], hidden_states.device.index)
+
+        # C+D_dynamic: advance the per-step window control loop on every MoE
+        # layer call (self-gates to once-per-step internally via the
+        # _FT_MOE_N_LAYERS-modulo boundary idiom, same as
+        # _slo_budget_decode_step / _iter_log_step_boundary). Must run
+        # whether or not this step ends up fusing >0 tokens, so the solver
+        # keeps sampling every step's latency, not just fused ones.
+        if _combined_mode == "C+D_dynamic" and _ft_moe_state["active"]:
+            _window_step_boundary(n_tok, _ft_moe_state["t_ft"])
+
+        # C+D_batch / C+D_dynamic real training: submit the attention-only
+        # fwd job and the backward job on the first qualifying step, then
+        # keep the chain going via _combined_fwd_done / _combined_bwd_done
+        # (same callbacks as C+D).
+        if (_combined_mode in ("C+D_batch", "C+D_dynamic")
+                and not _combined_demo_armed and _bt_trainer is not None):
             _combined_demo_armed = True
             _ft_moe_state["real_training"] = True
             _submit_combined_fwd_job()
 
         # Combined mode demo: arm fwd→bwd chain (B+D / C+D) or concatenated job (D+D).
-        if _combined_mode not in ("off", "C+D_batch") and not _combined_demo_armed:
+        if _combined_mode not in ("off", "C+D_batch", "C+D_dynamic") and not _combined_demo_armed:
             if _combined_mode == "D+D" and n_tok >= _sched_min_tokens:
                 _combined_demo_armed = True
                 _submit_combined_dd_job()
@@ -1689,7 +2294,13 @@ class MoERunner(MoERunnerInterface):
                         make_scheduler,
                     )
                     arm_bubble_scheduler(
-                        make_scheduler(sub_ops, device=dev, post_complete_fn=post_fn, label="bwd"),
+                        make_scheduler(
+                            sub_ops, device=dev, post_complete_fn=post_fn, label="bwd",
+                            on_subop_done=(
+                                _on_slo_budget_subop_done
+                                if _bwd_mode in ("slo_budget", "slo_budget_both") else None
+                            ),
+                        ),
                         min_tokens=min_tok,
                         fills_per_trigger=fills,
                         trigger_rank=tr,
@@ -1697,34 +2308,69 @@ class MoERunner(MoERunnerInterface):
             except _queue.Empty:
                 pass
 
-        # Backward scheduling: prefill-only dispatch with decode drain.
+        # Backward scheduling: where sub-ops are allowed to release depends on
+        # VLLM_FT_BWD_MODE (see global declaration near the top of the file).
         #
-        # Prefill path (n_tok >= _sched_min_tokens):
-        #   fill_one() is gated on a CUDA event recorded just before the TP
-        #   all_reduce so sub-ops start only once the main stream is blocked
-        #   at the NCCL barrier (the actual idle window).
+        # bubble mode (default) — prefill-only dispatch with decode drain:
+        #   Prefill path (n_tok >= _sched_min_tokens): fill_one() is gated on a
+        #   CUDA event recorded just before the TP all_reduce so sub-ops start
+        #   only once the main stream is blocked at the NCCL barrier (the
+        #   actual idle window).
+        #   Decode path (n_tok < _sched_min_tokens): no new sub-ops are
+        #   dispatched.  On the first decode call after a prefill (the
+        #   prefill→decode transition) we call pause_decode(), which records a
+        #   drain event on bwd_stream.  The main stream waits for that event so
+        #   any sub-ops already queued during the last prefill complete before
+        #   decode kernels start — eliminating the HBM bandwidth contention
+        #   that caused +40% TPOT in C+D mode.
         #
-        # Decode path (n_tok < _sched_min_tokens):
-        #   No new sub-ops are dispatched.  On the first decode call after a
-        #   prefill (the prefill→decode transition) we call pause_decode(),
-        #   which records a drain event on bwd_stream.  The main stream waits
-        #   for that event so any sub-ops already queued during the last
-        #   prefill complete before decode kernels start — eliminating the
-        #   HBM bandwidth contention that caused +40% TPOT in C+D mode.
-        global _bwd_sched_in_decode
+        # decode / both mode — LLMStation-style phase gating (ATC'25 paper §3,
+        # "Workers"): PEFT is suspended during prefill and only ever runs
+        # (fused forward / parallel backward tasklets) during decode.
+        #   decode: prefill is fully suspended — no fill_one() call at all, so
+        #   PEFT yields entirely to the prefilling phase.  Sub-ops release
+        #   continuously during decode instead, budgeted by
+        #   _bwd_decode_fills_per_trigger per MoE layer.  No pause_decode() /
+        #   resume_prefill() — decode is now an intentional drain channel, not
+        #   something to protect from backward interference.
+        #   both: prefill-bubble dispatch (as in "bubble" mode) AND decode
+        #   dispatch both stay active, draining the same sub-op cursor from two
+        #   disjoint-phase triggers that never compete for the same window.
+        #
+        # slo_budget mode — LLMStation's *actual* rule (Eq. 1, §4.2), not the
+        # fixed _bwd_decode_fills_per_trigger count above: prefill is fully
+        # suspended like "decode" mode, but the per-iteration dispatch count
+        # is solved from the decode SLO / current batch size / measured
+        # latencies via _slo_budget_decode_step() instead of being a constant.
+        #
+        # slo_budget_both mode — Arm B+C: same Eq.-1-budgeted decode dispatch
+        # as slo_budget, but prefill is NOT suspended -- bubble-gated dispatch
+        # (arm C) runs during prefill same as "bubble"/"both" mode, sharing
+        # the same sub-op cursor. B and C never compete for the same window
+        # since one only ever fires during prefill and the other only during
+        # decode.
+        global _bwd_sched_in_decode, _bwd_subops_in_decode
+        global _decode_iter_had_training, _iter_np_dispatched
         if _active_scheduler is not None and _active_scheduler.has_work():
-            if n_tok >= _sched_min_tokens:
-                # decode→prefill transition: re-enable dispatch.
-                if _bwd_sched_in_decode:
-                    _active_scheduler.resume_prefill()
-                    _bwd_sched_in_decode = False
+            is_prefill = n_tok >= _sched_min_tokens
+
+            if is_prefill and _bwd_sched_in_decode:
+                # decode→prefill transition: re-enable dispatch. Only ever set
+                # by the "bubble" mode's pause path below, so a no-op in
+                # decode/both mode, but harmless to check unconditionally.
+                _active_scheduler.resume_prefill()
+                _bwd_sched_in_decode = False
+
+            if _bwd_mode in ("bubble", "both", "slo_budget_both") and is_prefill:
                 if _ep_is_light_rank(self, router_logits, n_tok):
                     sync_evt = torch.cuda.Event()
                     sync_evt.record()
                     for _ in range(_sched_fills_per_trigger):
                         if not _active_scheduler.fill_one(in_bubble=True, sync_event=sync_evt):
                             break
-            elif n_tok > 0:
+                        _iter_log_count_bwd()
+
+            if _bwd_mode == "bubble" and not is_prefill and n_tok > 0:
                 # prefill→decode transition: pause and drain bwd_stream once.
                 if not _bwd_sched_in_decode:
                     drain_evt = _active_scheduler.pause_decode()
@@ -1739,6 +2385,24 @@ class MoERunner(MoERunnerInterface):
                             _pause_timing_pairs.append((_e0, _e1))
                     _bwd_sched_in_decode = True
                 # No dispatch during decode — bwd runs in prefill bubbles only.
+
+            if _bwd_mode in ("decode", "both") and not is_prefill and n_tok > 0:
+                for _ in range(_bwd_decode_fills_per_trigger):
+                    if not _active_scheduler.fill_one(in_bubble=False, sync_event=None):
+                        break
+                    _bwd_subops_in_decode += 1
+                    _iter_log_count_bwd()
+
+            if _bwd_mode in ("slo_budget", "slo_budget_both") and not is_prefill and n_tok > 0:
+                remaining = _slo_budget_decode_step(n_tok)
+                for _ in range(remaining):
+                    if not _active_scheduler.fill_one(in_bubble=False, sync_event=None):
+                        break
+                    _iter_np_dispatched += 1
+                    _decode_iter_had_training = True
+                    _bwd_subops_in_decode += 1
+                    _iter_log_count_bwd()
+
             if not _active_scheduler.has_work():
                 disarm_bubble_scheduler()
                 _bwd_sched_in_decode = False
@@ -1774,6 +2438,7 @@ class MoERunner(MoERunnerInterface):
                 for _ in range(_fwd_fills_per_trigger):
                     if not _fwd_active_scheduler.fill_one(in_bubble=True, sync_event=fwd_sync_evt):
                         break
+                    _iter_log_count_fwd()
                 if not _fwd_active_scheduler.has_work():
                     disarm_fwd_scheduler()
 
@@ -1815,6 +2480,7 @@ class MoERunner(MoERunnerInterface):
                 for _ in range(_fwd_fills_per_trigger):
                     if not _fwd_active_scheduler.fill_one(in_bubble=False, sync_event=None):
                         break
+                    _iter_log_count_fwd()
                 if not _fwd_active_scheduler.has_work():
                     disarm_fwd_scheduler()
 
