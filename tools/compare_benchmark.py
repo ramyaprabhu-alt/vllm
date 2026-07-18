@@ -749,6 +749,15 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         "--port",
         str(PORT),
     ]
+    if args.enable_eplb:
+        # Same config as scripts/run_qwen3_30b_a3b.sh: 8 redundant expert
+        # slots per GPU (64 base + 8), async non-blocking rebalance.
+        eplb_config = (
+            '{"num_redundant_experts": 8, "window_size": 1000, '
+            '"step_interval": 3000, "use_async": true, '
+            '"log_balancedness": true, "log_balancedness_interval": 100}'
+        )
+        server_cmd += ["--enable-eplb", "--eplb-config", eplb_config]
     # Note: --enable-lora is intentionally omitted. The real LoRA trainer
     # (bt_lora_trainer.py) loads adapter weights directly from the safetensors
     # file and does not use vLLM's LoRA serving infrastructure. Adding
@@ -813,6 +822,7 @@ def run_bubble_tea(args, result_dir: Path, log) -> dict:
         "num_prompts": args.num_prompts,
         "trace_file": str(args.trace_file) if args.trace_file else None,
         "real_training": bool(lora_path),
+        "enable_eplb": args.enable_eplb,
     }
     if args.ft:
         config["combined_mode"] = args.ft_mode
@@ -1126,6 +1136,15 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         help="Enable fine-tuning co-serving (default: on). "
         "Use --no-ft for inference-only baseline.",
+    )
+    parser.add_argument(
+        "--enable-eplb",
+        action="store_true",
+        default=False,
+        help="Enable expert-parallel load balancing on the bubble_tea server "
+        "(--enable-eplb + --eplb-config, same 8-redundant-expert async "
+        "config as scripts/run_qwen3_30b_a3b.sh). Default: off, matching "
+        "every prior sweep in this file's history.",
     )
     args = parser.parse_args()
     MODEL_DIR = args.model
